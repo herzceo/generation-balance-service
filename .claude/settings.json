@@ -1,0 +1,86 @@
+{
+  "teammateMode": "auto",
+  "skillListingBudgetFraction": 0.03,
+  "statusLine": {
+    "type": "command",
+    "command": "bash .claude/hooks/caveman-statusline.sh"
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "just check"
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "just plan-guard"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "just init"
+          },
+          {
+            "type": "command",
+            "command": "just status"
+          },
+          {
+            "type": "command",
+            "command": "just caveman-activate"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "just workflow-reminder"
+          },
+          {
+            "type": "command",
+            "command": "just caveman-track"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "just stop-reflect"
+          },
+          {
+            "type": "command",
+            "command": "just stop-reminder"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "just notify"
+          }
+        ]
+      }
+    ]
+  }
+}

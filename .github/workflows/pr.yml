@@ -1,0 +1,28 @@
+# PR-specific checks that run only on pull_request events.
+# Validates the PR title follows the project's Conventional Commits convention:
+#   <type>: <short summary>  (types: feat | fix | refactor | test | docs | chore | ci)
+
+name: PR
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+jobs:
+  title:
+    name: PR title
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            refactor
+            test
+            docs
+            chore
+            ci
+          requireScope: false

@@ -1,0 +1,25 @@
+name: Integration tests (reusable)
+
+on:
+  workflow_call:
+
+jobs:
+  test-integration:
+    name: Integration tests
+    # Docker (required by testcontainers) is pre-installed on ubuntu runners.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-uv
+
+      - name: Cache nox environments
+        uses: actions/cache@v4
+        with:
+          path: .nox
+          key: nox-integration-${{ hashFiles('uv.lock') }}
+          restore-keys: nox-integration-
+
+      - name: Run integration tests
+        run: uv run nox -s integration

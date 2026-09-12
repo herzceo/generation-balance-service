@@ -1,0 +1,25 @@
+# Entry point for CI. Calls reusable workflows for lint and tests.
+# Triggers on every push and on pull_request (where GitHub checks out
+# the merge commit so the PR is tested against the latest target branch).
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Cancel in-progress runs for the same ref when a new commit is pushed.
+# Runs on main are never cancelled so the audit trail stays complete.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  lint:
+    uses: ./.github/workflows/reusable.lint.yml
+
+  test-unit:
+    uses: ./.github/workflows/reusable.test-unit.yml
+
+  test-integration:
+    uses: ./.github/workflows/reusable.test-integration.yml

@@ -1,0 +1,28 @@
+name: Unit tests (reusable)
+
+on:
+  workflow_call:
+
+jobs:
+  test-unit:
+    name: Unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-uv
+
+      - name: Cache nox environments
+        uses: actions/cache@v4
+        with:
+          path: .nox
+          key: nox-unit-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: nox-unit-${{ runner.os }}-
+
+      - name: Run unit tests
+        run: uv run nox -s unit

@@ -1,0 +1,51 @@
+fail_fast: true
+
+
+repos:
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    rev: 0.10.8
+    hooks:
+      - id: uv-lock
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: detect-private-key
+      - id: check-added-large-files
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.4
+    hooks:
+      - id: ruff-format
+        entry: uv run --isolated --frozen ruff format
+        args:
+          - "--config"
+          - "pyproject.toml"
+          - "--force-exclude"
+        language: system
+        always_run: true
+
+      - id: ruff
+        entry: uv run --isolated --frozen ruff check
+        args:
+          - "--config"
+          - "pyproject.toml"
+          - "--force-exclude"
+        language: system
+        always_run: true
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.19.1
+    hooks:
+      - id: mypy
+        entry: uv run --isolated --frozen mypy
+        args:
+          - "--config-file"
+          - "pyproject.toml"
+        language: system
+        always_run: true
+        exclude: ^scripts/

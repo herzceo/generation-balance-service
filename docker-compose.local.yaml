@@ -1,0 +1,43 @@
+
+services:
+  database:
+    container_name: generation-balance.local.database
+    image: postgres:18
+    shm_size: 1g
+    volumes:
+      - psql_data:/var/lib/postgresql:rw
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    command: postgres -c 'max_connections=${POSTGRES_MAX_CONNECTIONS:-150}'
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-generations}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-generations}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASS:-postgres}
+
+  redis:
+    container_name: generation-balance.local.redis
+    image: redis:8
+    volumes:
+      - redis_data:/data
+    # AOF keeps the hot balances across restarts; noeviction keeps them from being dropped under memory pressure.
+    command: redis-server --appendonly yes --maxmemory-policy noeviction
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  psql_data:
+    name: generation-balance.local.psql_data
+  redis_data:
+    name: generation-balance.local.redis_data
