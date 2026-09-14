@@ -11,10 +11,12 @@ from .balance_store import (
     RefundOutcome,
     ReserveOutcome,
     Reserved,
+    SettleOutcome,
     Stale,
     TopUpOutcome,
     money_to_str,
     str_to_money,
+    surplus_refund,
 )
 from .generation_provider import GenerationProvider
 
@@ -32,8 +34,10 @@ __all__ = (
     "RefundOutcome",
     "ReserveOutcome",
     "Reserved",
+    "SettleOutcome",
     "Stale",
     "TopUpOutcome",
     "money_to_str",
     "str_to_money",
+    "surplus_refund",
 )

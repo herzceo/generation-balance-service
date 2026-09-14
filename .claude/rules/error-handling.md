@@ -69,8 +69,9 @@ Other Option methods:
 
 - Wrap provider exceptions into `GenerationFailedError` **after** the refund has been applied;
   refund on `BaseException` so cancellation also refunds, then re-raise the original.
-- `settle`/`refund` outcomes `Stale` mean the record is no longer `running`: log and continue, never
-  retry the balance change.
+- `refund` outcome `Stale` means the record is no longer `running`: return, never retry the balance
+  change. `settle` outcome `Stale` means the reaper already refunded the reservation: discard the
+  result and raise `GenerationFailedError`, never return a refunded generation.
 - Retry exhaustion raises `BalanceContentionError`; never silently drop an operation.
 
 ## Key Rules

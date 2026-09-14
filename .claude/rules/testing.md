@@ -23,7 +23,7 @@ Never write unit tests for services, the Redis adapter, the repository or the fl
 tests/
 ├── unit/
 │   ├── internal/test_option.py
-│   └── billing/test_balance_snapshot.py
+│   └── billing/{test_balance_snapshot.py, test_surplus_refund.py}
 └── integration/
     ├── conftest.py            # session: postgres_url (alembic upgrade head), redis_url, manager
     ├── test_migrations.py     # compare_metadata(...) == []
@@ -39,7 +39,9 @@ tests/
         ├── test_cold_cache.py
         ├── test_pg_budget.py
         ├── test_convergence.py
-        └── test_multiprocess.py
+        ├── test_multiprocess.py
+        ├── test_settle_reconciliation.py   # ScaledProvider: billed below/above authorized, Redis retry
+        └── test_reaper.py                  # stale reservation refunded, inflight index hygiene
 ```
 
 ## Fixture scopes
@@ -83,6 +85,10 @@ parallel idiom; classify results by `isinstance`.
 - Redis balance: run a top-up, or seed PostgreSQL and let the cold load populate Redis.
 - `free_usd` cannot be topped up through `BalanceTopUp`; seed it via the PostgreSQL row.
 - Provider behaviour: `provider.set_scenario(client_request_id, ProviderScenario(delay_seconds=0.5, fail=True))`.
+- A provider that bills something other than the authorized cost: `ScaledProvider(provider, factor=..., override=...)`
+  from `helpers.py`, injected through `create_test_container(provider=...)`.
+- Reaper: `fast_billing_config(REAP_AFTER_SECONDS=0.1)` + a slow scenario, then loop `reap_once(container)`
+  inside `wait_until`; never sleep for the threshold.
 
 ## What to assert
 

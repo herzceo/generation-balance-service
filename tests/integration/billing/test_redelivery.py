@@ -134,3 +134,19 @@ async def test_redelivery_waiter_times_out_when_holder_never_settles(
         await impatient.close()
 
     assert provider.get_stats().calls == {}
+
+
+async def test_redelivery_after_completion_with_depleted_balance_returns_cached_result(
+    container: AsyncContainer, provider: FakeGenerationProvider
+) -> None:
+    user_id = uuid4()
+    await seed_pg_balance(container, user_id, paid_usd=Decimal("0.08"))
+    request = basic_request(user_id)
+    first = await run_generation(container, request)
+    assert (await get_balance(container, user_id)).paid_usd == Decimal(0)
+
+    second = await run_generation(container, request)
+
+    assert second == first
+    assert provider.get_stats().calls == {request.client_request_id: 1}
+    assert (await get_balance(container, user_id)).paid_usd == Decimal(0)

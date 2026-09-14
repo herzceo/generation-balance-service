@@ -61,6 +61,9 @@ class ImplRedisBalanceStore(BalanceStore):
 - A mutation and its bookkeeping (`SADD bal:dirty`, record HSET, marker SET) happen in the same
   script; never split them across round trips
 - Register scripts once with `redis.register_script(...)` (EVALSHA with automatic EVAL fallback)
+- Money-path commands (`settle`, `refund`, `forget_inflight`) go through `_retrying`: up to
+  `RETRY_ATTEMPTS` (3) on `redis.exceptions.ConnectionError`/`TimeoutError` with 50 ms · attempt
+  back-off; safe because every script is idempotent (`status == running` guard, version CAS)
 
 Key layout:
 
@@ -70,6 +73,7 @@ Key layout:
 | `bal:dirty` | SET | user ids with unflushed changes |
 | `bal:load:{user_id}` | STRING | cold-load lock (`SET NX PX`) |
 | `gen:{client_request_id}` | HASH | generation record; one TTL for running/done/failed |
+| `gen:inflight` | ZSET | running reservations scored by `started_at`; `RESERVE` adds, `SETTLE`/`REFUND` remove; the reaper scans it |
 | `topup:{operation_id}` | STRING | idempotency marker (value = user_id) |
 
 ## DI Wiring

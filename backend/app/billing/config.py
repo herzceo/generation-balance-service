@@ -10,3 +10,5 @@ class BillingConfig(StructDTO):
     LOAD_WAIT_TIMEOUT_SECONDS: float = 15.0
     FLUSH_INTERVAL_SECONDS: float = 1.0
     FLUSH_BATCH_SIZE: int = 500
+    REAP_AFTER_SECONDS: float = 300.0
+    REAP_BATCH_SIZE: int = 100

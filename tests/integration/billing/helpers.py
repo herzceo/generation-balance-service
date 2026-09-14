@@ -10,11 +10,16 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import event
 
-from backend.app.billing import BalanceFlusher, BalanceService, GenerationService
+from backend.app.billing import BalanceFlusher, BalanceService, GenerationService, ReservationReaper
 from backend.app.shared.db.database import Database
 from backend.app.shared.ports.billing import BalanceSnapshot, BalanceStore
 from backend.domain.entities.balance import Balance
-from backend.domain.generation import BalanceTopUp, GenerationRequest, GenerationResult
+from backend.domain.generation import (
+    BalanceTopUp,
+    FakeGenerationProvider,
+    GenerationRequest,
+    GenerationResult,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -85,6 +90,32 @@ async def flush_once(container: AsyncContainer) -> int:
     async with container() as c:
         flusher = await c.get(BalanceFlusher)
         return await flusher.flush_once()
+
+
+async def reap_once(container: AsyncContainer) -> int:
+    async with container() as c:
+        reaper = await c.get(ReservationReaper)
+        return await reaper.reap_once()
+
+
+@dataclass
+class ScaledProvider:
+    """Provider whose bill differs from the authorized cost; delegates the call to the fake."""
+
+    inner: FakeGenerationProvider
+    factor: Decimal = Decimal(1)
+    override: Decimal | None = None
+
+    async def generate(
+        self, request: GenerationRequest, *, authorized_cost_usd: Decimal
+    ) -> GenerationResult:
+        result = await self.inner.generate(request, authorized_cost_usd=authorized_cost_usd)
+        billed = self.override if self.override is not None else authorized_cost_usd * self.factor
+        return GenerationResult(
+            client_request_id=result.client_request_id,
+            content=result.content,
+            billed_cost_usd=billed,
+        )
 
 
 async def seed_pg_balance(

@@ -83,7 +83,7 @@ backend/
 │   └── repos/{__init__.py, balance.py, gateway.py}
 ├── app/
 │   ├── errors.py                     DetailedError hierarchy + billing errors
-│   ├── billing/{__init__.py, config.py, balance_loader.py, generation.py, balance.py, flusher.py}
+│   ├── billing/{__init__.py, config.py, balance_loader.py, generation.py, balance.py, refund.py, reaper.py, flusher.py}
 │   └── shared/
 │       ├── db/{__init__.py, database.py}
 │       └── ports/{__init__.py, billing/{__init__.py, balance_store.py, generation_provider.py}}
@@ -103,7 +103,7 @@ tests/
 └── integration/{conftest.py, test_migrations.py,
                  billing/{conftest.py, ioc.py, helpers.py, test_single.py, test_parallel.py, test_redelivery.py,
                           test_provider_errors.py, test_top_up.py, test_cold_cache.py, test_pg_budget.py,
-                          test_convergence.py, test_multiprocess.py}}
+                          test_convergence.py, test_multiprocess.py, test_settle_reconciliation.py, test_reaper.py}}
 docs/{PLAN.md, DECISIONS.md}
 ```
 
@@ -127,12 +127,12 @@ docs/{PLAN.md, DECISIONS.md}
 Standalone Protocol per entity: `BalanceRepo` with `get_by_user_id(user_id) -> Option[Balance]` and `upsert_many(balances: list[Balance]) -> None`. `ImplBalanceRepo` is `@final`, `__slots__ = ("_session",)`, takes an `AsyncSession`; `upsert_many` sorts rows by `user_id` and issues one `INSERT ... ON CONFLICT (user_id) DO UPDATE ... WHERE excluded.version > balance.version`. Central access via `RepoGateway` Protocol + `ImplRepoGateway` with `@cached_property`. All lookups return `Option[T]`.
 
 ### Port / Adapter (app/shared/ports/billing/ + infra/database/redis/adapters/)
-`BalanceStore` is the Redis port (load, seed_if_absent, load lock, reserve, get_generation, settle, refund, top_up, dirty_users, clear_dirty) with value types `BalanceSnapshot` (non-frozen `StructDTO`, satisfies `BalanceView`), `GenerationRecord`, and outcome dataclasses (`Reserved`, `Conflict`, `Missing`, `Duplicate`, `Applied`, `AlreadyApplied`, `Stale`). `GenerationProvider` is the provider port; `FakeGenerationProvider` satisfies it structurally, no wrapper. `ImplRedisBalanceStore` runs the Lua scripts from `infra/database/redis/scripts.py`. Lua compares only the integer `version` and writes strings; all money arithmetic is Python `Decimal` serialised with `format(d, "f")`.
+`BalanceStore` is the Redis port (load, seed_if_absent, load lock, reserve, get_generation, settle, refund, top_up, stale_inflight, forget_inflight, dirty_users, clear_dirty) with value types `BalanceSnapshot` (non-frozen `StructDTO`, satisfies `BalanceView`), `GenerationRecord`, and outcome dataclasses (`Reserved`, `Conflict`, `Missing`, `Duplicate`, `Applied`, `AlreadyApplied`, `Stale`). `GenerationProvider` is the provider port; `FakeGenerationProvider` satisfies it structurally, no wrapper. `ImplRedisBalanceStore` runs the Lua scripts from `infra/database/redis/scripts.py`. Lua compares only the integer `version` and writes strings; all money arithmetic is Python `Decimal` serialised with `format(d, "f")`.
 
-Redis keys: `bal:{user_id}` hash (`free_usd bonus_usd paid_usd free_requests version`, no TTL), `bal:dirty` set, `bal:load:{user_id}` cold-load lock (`SET NX PX`), `gen:{client_request_id}` record hash (status running/done/failed, plan, result; one TTL for every status), `topup:{operation_id}` idempotency marker.
+Redis keys: `bal:{user_id}` hash (`free_usd bonus_usd paid_usd free_requests version`, no TTL), `bal:dirty` set, `bal:load:{user_id}` cold-load lock (`SET NX PX`), `gen:{client_request_id}` record hash (status running/done/failed, plan, result; one TTL for every status), `gen:inflight` ZSET of running reservations scored by `started_at` (the reaper's index), `topup:{operation_id}` idempotency marker.
 
 ### Services (app/billing/)
-`@dataclass`, REQUEST-scoped, dependencies typed to Protocols. `BalanceLoader.ensure_loaded` (cold load behind the Redis lock, exactly one PG SELECT per cache miss), `GenerationService.execute_generation` (validate model → snapshot → `DebitPolicyService.authorize` → CAS `reserve` loop → provider call outside any lock → `settle` or `refund`; duplicates resolved from the record, running ones awaited by polling), `BalanceService.apply_top_up` / `get_balance` (validated, idempotent CAS), `BalanceFlusher.flush_once` / `run` (dirty users → one multi-row upsert → version-conditional clear). Service knobs live in `BillingConfig` (`app/billing/config.py`); the adapter's TTLs (`GENERATION_RECORD_TTL_SECONDS`, `TOP_UP_RECORD_TTL_SECONDS`, `LOAD_LOCK_TTL_MS`) live in `RedisBalanceStoreConfig` next to `ImplRedisBalanceStore`. Both are APP singletons.
+`@dataclass`, REQUEST-scoped, dependencies typed to Protocols. `BalanceLoader.ensure_loaded` (cold load behind the Redis lock, exactly one PG SELECT per cache miss), `GenerationService.execute_generation` (validate model → snapshot → `DebitPolicyService.authorize` → CAS `reserve` loop → provider call outside any lock → `settle` (CAS when the provider billed below the plan: surplus refunded LIFO along the charge order, authorization is a ceiling; `Stale` = reaped → `GenerationFailedError`) or `refund` via `ReservationRefunder`; duplicates resolved from the record, running ones awaited by polling; a denied redelivery still returns its cached outcome), `BalanceService.apply_top_up` / `get_balance` (validated, idempotent CAS), `ReservationReaper.reap_once` (refunds `running` records older than `REAP_AFTER_SECONDS` from `gen:inflight`), `BalanceFlusher.flush_once` / `run` (dirty users → one multi-row upsert → version-conditional clear; `run` also calls `reap_once` every tick). Service knobs live in `BillingConfig` (`app/billing/config.py`); the adapter's TTLs (`GENERATION_RECORD_TTL_SECONDS`, `TOP_UP_RECORD_TTL_SECONDS`, `LOAD_LOCK_TTL_MS`) live in `RedisBalanceStoreConfig` next to `ImplRedisBalanceStore`. Both are APP singletons.
 
 ### Errors (app/errors.py)
 `DetailedError(message, code, details)` hierarchy: `NotFoundError`, `InvalidInputError`, `ConflictError`, plus `GenerationFailedError` (provider raised; cached per `client_request_id`), `GenerationInProgressError` (waiter deadline), `BalanceContentionError` (CAS/load retries exhausted). Access errors from the given module (`InsufficientBalanceError`, `FreeRequestsExhaustedError`, `ConditionalFreeAccessDeniedError`) propagate untouched. `Option[T].some(exc)` for repo lookups.
@@ -141,7 +141,7 @@ Redis keys: `bal:{user_id}` hash (`free_usd bonus_usd paid_usd free_requests ver
 `Database` Protocol = unit of work (`async with self.db:` opens a transaction, `commit()` explicit) + `gateway` to repositories. `ImplDatabase` in `infra/database/psql/database.py`. Sessionmaker uses `expire_on_commit=False, autoflush=False`.
 
 ### Dependency Injection (entry/ioc.py)
-`create_container(*, engine, redis, billing_config, store_config=None, provider=None)` composes Dishka providers: APP — engine, sessionmaker, `Redis`, `BillingConfig`, `RedisBalanceStoreConfig`, `DebitPolicyService`, `ImplRedisBalanceStore → BalanceStore`, `provider → GenerationProvider`; REQUEST — `ImplDatabase → Database`, `BalanceLoader`, `GenerationService`, `BalanceService`, `BalanceFlusher`. Engine and Redis lifetimes belong to the caller (`entry/flusher.py` or the test fixture). Bind impl to Protocol: `provider.provide(Impl, provides=Protocol)`. Config values travel as `StructDTO` config classes, never bare primitives.
+`create_container(*, engine, redis, billing_config, store_config=None, provider=None)` composes Dishka providers: APP — engine, sessionmaker, `Redis`, `BillingConfig`, `RedisBalanceStoreConfig`, `DebitPolicyService`, `ImplRedisBalanceStore → BalanceStore`, `provider → GenerationProvider`; REQUEST — `ImplDatabase → Database`, `BalanceLoader`, `ReservationRefunder`, `ReservationReaper`, `GenerationService`, `BalanceService`, `BalanceFlusher`. Engine and Redis lifetimes belong to the caller (`entry/flusher.py` or the test fixture). Bind impl to Protocol: `provider.provide(Impl, provides=Protocol)`. Config values travel as `StructDTO` config classes, never bare primitives.
 
 ### Migrations (infra/database/psql/alembic/)
 One hand-written init migration creates `balance`. `tests/integration/test_migrations.py` asserts `compare_metadata(...) == []` against the migrated testcontainer database, so entity and migration cannot drift silently.

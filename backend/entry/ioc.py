@@ -12,6 +12,8 @@ from backend.app.billing import (
     BalanceService,
     BillingConfig,
     GenerationService,
+    ReservationReaper,
+    ReservationRefunder,
 )
 from backend.app.shared.db.database import Database
 from backend.app.shared.ports.billing import BalanceStore, GenerationProvider
@@ -53,6 +55,8 @@ def create_infra_provider(
 def create_billing_provider() -> Provider:
     provider = Provider(scope=Scope.REQUEST)
     provider.provide(BalanceLoader, provides=BalanceLoader)
+    provider.provide(ReservationRefunder, provides=ReservationRefunder)
+    provider.provide(ReservationReaper, provides=ReservationReaper)
     provider.provide(GenerationService, provides=GenerationService)
     provider.provide(BalanceService, provides=BalanceService)
     provider.provide(BalanceFlusher, provides=BalanceFlusher)

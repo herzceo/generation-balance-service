@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 
 from backend.app.billing.config import BillingConfig
+from backend.app.billing.reaper import ReservationReaper
 from backend.app.shared.db.database import Database
 from backend.app.shared.ports.billing.balance_store import BalanceStore
 from backend.domain.entities.balance import Balance
@@ -15,6 +16,7 @@ class BalanceFlusher:
 
     store: BalanceStore
     db: Database
+    reaper: ReservationReaper
     config: BillingConfig
 
     async def flush_once(self) -> int:
@@ -49,6 +51,7 @@ class BalanceFlusher:
         try:
             while True:
                 flushed = await self.flush_once()
+                await self.reaper.reap_once()
                 if flushed < self.config.FLUSH_BATCH_SIZE:
                     await asyncio.sleep(self.config.FLUSH_INTERVAL_SECONDS)
         except asyncio.CancelledError:

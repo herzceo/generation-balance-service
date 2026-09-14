@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+import asyncio
+from collections.abc import Awaitable, Callable, Sequence
 from decimal import Decimal
 from typing import Any, cast, final
 from uuid import UUID
 
 from redis.asyncio import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from backend.app.shared.ports.billing.balance_store import (
     AlreadyApplied,
@@ -20,6 +23,7 @@ from backend.app.shared.ports.billing.balance_store import (
     RefundOutcome,
     ReserveOutcome,
     Reserved,
+    SettleOutcome,
     Stale,
     TopUpOutcome,
     money_to_str,
@@ -31,12 +35,16 @@ from backend.internal import Option
 from backend.internal.dto import StructDTO
 
 DIRTY_KEY = "bal:dirty"
+INFLIGHT_KEY = "gen:inflight"
+
+_RETRIED_ERRORS = (RedisConnectionError, RedisTimeoutError)
 
 
 class RedisBalanceStoreConfig(StructDTO):
     GENERATION_RECORD_TTL_SECONDS: int = 86400
     TOP_UP_RECORD_TTL_SECONDS: int = 86400
     LOAD_LOCK_TTL_MS: int = 5000
+    RETRY_ATTEMPTS: int = 3
 
 
 def balance_key(user_id: UUID) -> str:
@@ -99,11 +107,16 @@ def _record_from_fields(fields: dict[str, str]) -> GenerationRecord:
         authorized_cost_usd=str_to_money(fields["authorized_cost_usd"]),
         started_at=float(fields["started_at"]),
         content=fields.get("content") or None,
-        billed_cost_usd=str_to_money(fields["billed_cost_usd"])
-        if fields.get("billed_cost_usd")
-        else None,
+        billed_cost_usd=_optional_money(fields, "billed_cost_usd"),
+        provider_billed_cost_usd=_optional_money(fields, "provider_billed_cost_usd"),
+        refunded_surplus_usd=_optional_money(fields, "refunded_surplus_usd"),
         error=fields.get("error") or None,
     )
+
+
+def _optional_money(fields: dict[str, str], name: str) -> Decimal | None:
+    raw = fields.get(name)
+    return str_to_money(raw) if raw else None
 
 
 _DUP_FIELDS = (
@@ -119,6 +132,8 @@ _DUP_FIELDS = (
     "started_at",
     "content",
     "billed_cost_usd",
+    "provider_billed_cost_usd",
+    "refunded_surplus_usd",
     "error",
 )
 
@@ -145,6 +160,18 @@ class ImplRedisBalanceStore(BalanceStore):
         self._top_up = redis.register_script(scripts.TOP_UP)
         self._seed = redis.register_script(scripts.SEED_IF_ABSENT)
         self._clear_dirty = redis.register_script(scripts.CLEAR_DIRTY)
+
+    async def _retrying[T](self, call: Callable[[], Awaitable[T]]) -> T:
+        """Re-issue a money-path command on transient transport errors; scripts are idempotent."""
+        attempt = 1
+        while True:
+            try:
+                return await call()
+            except _RETRIED_ERRORS:
+                if attempt >= self._config.RETRY_ATTEMPTS:
+                    raise
+                await asyncio.sleep(0.05 * attempt)
+                attempt += 1
 
     async def load(self, user_id: UUID) -> Option[BalanceSnapshot]:
         fields = cast("dict[str, str]", await self._redis.hgetall(balance_key(user_id)))  # type: ignore[misc]
@@ -196,6 +223,7 @@ class ImplRedisBalanceStore(BalanceStore):
                     balance_key(request.user_id),
                     generation_key(request.client_request_id),
                     DIRTY_KEY,
+                    INFLIGHT_KEY,
                 ],
                 args=[
                     str(expected_version),
@@ -210,6 +238,7 @@ class ImplRedisBalanceStore(BalanceStore):
                     money_to_str(authorized_cost_usd),
                     repr(started_at),
                     str(self._config.GENERATION_RECORD_TTL_SECONDS),
+                    str(request.client_request_id),
                 ],
             ),
         )
@@ -232,17 +261,51 @@ class ImplRedisBalanceStore(BalanceStore):
         return Option(_record_from_fields(fields) if fields else None)
 
     async def settle(
-        self, client_request_id: UUID, *, content: str, billed_cost_usd: Decimal
-    ) -> bool:
-        reply = await self._settle(
-            keys=[generation_key(client_request_id)],
-            args=[
-                content,
-                money_to_str(billed_cost_usd),
-                str(self._config.GENERATION_RECORD_TTL_SECONDS),
-            ],
+        self,
+        *,
+        user_id: UUID,
+        client_request_id: UUID,
+        content: str,
+        billed_cost_usd: Decimal,
+        provider_billed_cost_usd: Decimal,
+        refunded_surplus_usd: Decimal,
+        expected_version: int | None,
+        new: BalanceSnapshot | None,
+    ) -> SettleOutcome:
+        balance_args = _snapshot_args(new) if new is not None else ["", "", "", ""]
+        reply = cast(
+            "list[str]",
+            await self._retrying(
+                lambda: self._settle(
+                    keys=[
+                        generation_key(client_request_id),
+                        balance_key(user_id),
+                        DIRTY_KEY,
+                        INFLIGHT_KEY,
+                    ],
+                    args=[
+                        content,
+                        money_to_str(billed_cost_usd),
+                        money_to_str(provider_billed_cost_usd),
+                        str(self._config.GENERATION_RECORD_TTL_SECONDS),
+                        str(client_request_id),
+                        str(user_id),
+                        "" if expected_version is None else str(expected_version),
+                        *balance_args,
+                        money_to_str(refunded_surplus_usd),
+                    ],
+                )
+            ),
         )
-        return bool(reply)
+        match reply[0]:
+            case "OK":
+                return Applied()
+            case "CONFLICT":
+                return Conflict(current=_snapshot_from_conflict(reply))
+            case "MISSING":
+                return Missing()
+            case _:
+                return Stale()
 
     async def refund(
         self,
@@ -255,15 +318,23 @@ class ImplRedisBalanceStore(BalanceStore):
     ) -> RefundOutcome:
         reply = cast(
             "list[str]",
-            await self._refund(
-                keys=[balance_key(user_id), generation_key(client_request_id), DIRTY_KEY],
-                args=[
-                    str(expected_version),
-                    *_snapshot_args(new),
-                    str(user_id),
-                    error,
-                    str(self._config.GENERATION_RECORD_TTL_SECONDS),
-                ],
+            await self._retrying(
+                lambda: self._refund(
+                    keys=[
+                        balance_key(user_id),
+                        generation_key(client_request_id),
+                        DIRTY_KEY,
+                        INFLIGHT_KEY,
+                    ],
+                    args=[
+                        str(expected_version),
+                        *_snapshot_args(new),
+                        str(user_id),
+                        error,
+                        str(self._config.GENERATION_RECORD_TTL_SECONDS),
+                        str(client_request_id),
+                    ],
+                )
             ),
         )
         match reply[0]:
@@ -305,6 +376,16 @@ class ImplRedisBalanceStore(BalanceStore):
                 return Missing()
             case _:
                 return AlreadyApplied()
+
+    async def stale_inflight(self, *, older_than: float, limit: int) -> list[UUID]:
+        members = cast(
+            "list[str]",
+            await self._redis.zrangebyscore(INFLIGHT_KEY, "-inf", older_than, start=0, num=limit),
+        )
+        return [UUID(member) for member in members]
+
+    async def forget_inflight(self, client_request_id: UUID) -> None:
+        await self._retrying(lambda: self._redis.zrem(INFLIGHT_KEY, str(client_request_id)))
 
     async def dirty_users(self, limit: int) -> list[UUID]:
         members = cast("list[str]", await self._redis.srandmember(DIRTY_KEY, limit))  # type: ignore[misc]

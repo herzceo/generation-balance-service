@@ -8,7 +8,7 @@ from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
-from backend.domain.generation import BalanceTopUp, DebitPlan, GenerationRequest
+from backend.domain.generation import BalanceTopUp, DebitPlan, DebitPolicy, GenerationRequest
 from backend.internal import Option
 from backend.internal.dto import StructDTO
 
@@ -19,6 +19,32 @@ def money_to_str(amount: Decimal) -> str:
 
 def str_to_money(raw: str) -> Decimal:
     return Decimal(raw)
+
+
+_CHARGE_ORDER: dict[DebitPolicy, tuple[str, ...]] = {
+    DebitPolicy.PAID_ONLY: ("paid",),
+    DebitPolicy.PAID_THEN_FREE_THEN_BONUS: ("paid", "free", "bonus"),
+    DebitPolicy.DEFAULT: ("free", "bonus", "paid"),
+}
+
+
+def surplus_refund(plan: DebitPlan, policy: DebitPolicy, billed_cost_usd: Decimal) -> DebitPlan:
+    """Amounts to give back when the provider billed less than the authorized plan.
+
+    The authorization is a ceiling: billing above it is capped, never charged. The surplus is
+    returned LIFO along the policy's charge order, so the bucket charged last is refunded first.
+    ``free_requests`` are never refunded here.
+    """
+    charged = {"free": plan.free_usd, "bonus": plan.bonus_usd, "paid": plan.paid_usd}
+    remaining = plan.total_usd - max(Decimal(0), min(billed_cost_usd, plan.total_usd))
+    refund = {"free": Decimal(0), "bonus": Decimal(0), "paid": Decimal(0)}
+    for bucket in reversed(_CHARGE_ORDER[policy]):
+        taken = min(charged[bucket], remaining)
+        refund[bucket] = taken
+        remaining -= taken
+        if remaining == 0:
+            break
+    return DebitPlan(free_usd=refund["free"], bonus_usd=refund["bonus"], paid_usd=refund["paid"])
 
 
 class BalanceSnapshot(StructDTO, kw_only=True):
@@ -84,6 +110,8 @@ class GenerationRecord(StructDTO, kw_only=True):
     started_at: float
     content: str | None = None
     billed_cost_usd: Decimal | None = None
+    provider_billed_cost_usd: Decimal | None = None
+    refunded_surplus_usd: Decimal | None = None
     error: str | None = None
 
 
@@ -119,6 +147,7 @@ class Stale: ...
 
 
 type ReserveOutcome = Reserved | Conflict | Missing | Duplicate
+type SettleOutcome = Applied | Conflict | Missing | Stale
 type RefundOutcome = Applied | Conflict | Missing | Stale
 type TopUpOutcome = Applied | Conflict | Missing | AlreadyApplied
 
@@ -158,8 +187,19 @@ class BalanceStore(Protocol):
 
     @abstractmethod
     async def settle(
-        self, client_request_id: UUID, *, content: str, billed_cost_usd: Decimal
-    ) -> bool: ...
+        self,
+        *,
+        user_id: UUID,
+        client_request_id: UUID,
+        content: str,
+        billed_cost_usd: Decimal,
+        provider_billed_cost_usd: Decimal,
+        refunded_surplus_usd: Decimal,
+        expected_version: int | None,
+        new: BalanceSnapshot | None,
+    ) -> SettleOutcome:
+        """Mark the record done; with ``expected_version``/``new`` also refund a surplus by CAS."""
+        ...
 
     @abstractmethod
     async def refund(
@@ -181,6 +221,12 @@ class BalanceStore(Protocol):
         expected_version: int,
         new: BalanceSnapshot,
     ) -> TopUpOutcome: ...
+
+    @abstractmethod
+    async def stale_inflight(self, *, older_than: float, limit: int) -> list[UUID]: ...
+
+    @abstractmethod
+    async def forget_inflight(self, client_request_id: UUID) -> None: ...
 
     @abstractmethod
     async def dirty_users(self, limit: int) -> list[UUID]: ...

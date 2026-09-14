@@ -72,13 +72,17 @@ a top-up between deliveries legitimately turns a denial into a success.
 keyspace notifications and in-process events were rejected as extra machinery for a 100 ms
 provider. The waiter never touches the balance.
 
-### D7. The reservation is the charge; `settle` records the result only
+### D7. The authorization is a ceiling; `settle` reconciles what the provider actually billed
 
-`FakeGenerationProvider` always returns `billed_cost_usd == authorized_cost_usd`. `SETTLE` writes
-`content` and `billed_cost_usd` for audit and does not change buckets or mark the user dirty. A
-mismatch is logged; the extension (refund the difference into `paid_usd` inside the same script)
-is documented, not built, because `DebitPolicyService` does not define which bucket a difference
-belongs to.
+`SETTLE` records the result and, when the provider billed less than the reserved plan, gives the
+surplus back in the same Lua step through the usual `version` CAS. The surplus is returned LIFO
+along the policy's charge order (`DEFAULT` charges free → bonus → paid, so it refunds paid →
+bonus → free); `free_requests` are never returned. A bill above the authorized total is capped:
+the user is charged the authorized amount, the raw provider value is kept on the record
+(`provider_billed_cost_usd`) and a warning is logged. `GenerationResult.billed_cost_usd` and the
+cached redelivery outcome both carry the amount actually charged. `FakeGenerationProvider`
+always bills the authorized cost, so the fast path (`expected_version=None`) does not touch the
+balance; tests exercise the surplus path with a wrapping provider that bills less or more.
 
 ### D8. Refund is a CAS in Python, guarded by `status == running`
 
@@ -109,7 +113,7 @@ and reseed.
 
 `running`, `done` and `failed` records all live `GENERATION_RECORD_TTL_SECONDS` (24 h). A short
 TTL on `running` would let a still-running debit lose its record and re-enable double charging on
-redelivery. Staleness is a reaper's job, not TTL's (see O1).
+redelivery. Staleness is the reaper's job, not TTL's (see D16).
 
 ### D12. Payload drift on the same `client_request_id` is rejected
 
@@ -139,6 +143,32 @@ nothing else (verified: psycopg async + SQLAlchemy 2.0.46 emit no dialect-init, 
 or ping statements through the cursor). Multi-process workers report their own counts.
 `pg_stat_*` views were rejected (lazy stats flush, count transactions not statements).
 
+### D16. Stuck reservations are reaped by the flusher process
+
+`RESERVE` also adds the id to the `gen:inflight` ZSET scored by `started_at`; `SETTLE` and
+`REFUND` remove it. Each flusher tick runs `ReservationReaper.reap_once`: ids older than
+`REAP_AFTER_SECONDS` (300 s) whose record is still `running` are refunded through the same
+`REFUND` CAS (guarded by `status == running`, so a concurrent normal refund cannot double it) and
+marked `failed`; ids whose record already finished are simply dropped from the index. A holder
+that finishes after the reap gets `STALE` from `SETTLE`, discards its content and raises
+`GenerationFailedError`; nothing is charged twice or refunded twice. The reaper never touches
+PostgreSQL. Trade-off: a generation that legitimately runs longer than `REAP_AFTER_SECONDS` is
+cancelled; the threshold is configuration.
+
+### D17. Transient Redis errors on the money path are retried
+
+`settle`, `refund` and `forget_inflight` retry `redis.exceptions.ConnectionError` /
+`TimeoutError` up to `RETRY_ATTEMPTS` (3) with a 50 ms · attempt back-off. The scripts are
+idempotent (`status == running` guard, version CAS), so a command whose reply was lost can be
+replayed safely. Other exceptions propagate.
+
+### D18. A redelivery keeps its cached outcome even when the balance has since dropped
+
+`authorize` runs before `RESERVE`, so a redelivery of a finished generation could be denied by
+the policy when the balance no longer covers the cost. `GenerationAccessError` therefore first
+checks for an existing record and returns the cached outcome; only a genuinely new request is
+denied. The hot path pays nothing for this: the record lookup happens only on denial.
+
 ## 2. Edge cases and how they are handled
 
 | Case | Handling |
@@ -160,7 +190,12 @@ or ping statements through the cursor). Multi-process workers report their own c
 | Two flushers flush the same user | version-guarded upsert is idempotent; rows sorted by `user_id` |
 | Flusher crashes mid-batch | dirty flags survive; next tick re-flushes |
 | Mutation lands during a flush | clear is skipped (version moved); user stays dirty |
-| `settle` finds the record not running (expired) | warning logged; result returned; charge stands |
+| Process dies between `RESERVE` and `SETTLE`/`REFUND` | record stays `running`; the flusher's reaper refunds it after `REAP_AFTER_SECONDS` and marks it `failed` |
+| Holder finishes after the reaper refunded it | `SETTLE` returns `STALE`; content discarded; `GenerationFailedError`; no double charge, no double refund |
+| Provider bills less than authorized | surplus refunded LIFO along the charge order inside `SETTLE`; `billed_cost_usd` = charged |
+| Provider bills more than authorized | capped at the authorized total; warning logged; raw value kept on the record |
+| Transient Redis error on settle/refund | retried up to 3 times; scripts idempotent |
+| Redelivery after success when the balance no longer covers the cost | cached result returned, no denial |
 | CAS retries exhausted | `BalanceContentionError` (a `ConflictError`) |
 
 ## 3. Assumptions
@@ -182,24 +217,18 @@ or ping statements through the cursor). Multi-process workers report their own c
   internally consistent balance and Redis reseeds from it.
 - Idempotency window = record TTL. A durable PG dedup check on every cache miss was rejected
   because every new generation is a miss, which would cost one PG read per generation.
-- A process that dies between `RESERVE` and `SETTLE`/`REFUND` leaves a `running` record and a
-  standing debit until the TTL expires; the debit is then never refunded. See O1.
-- Redis connection errors between provider return and `settle` (or before `refund`) are not
-  retried; the outcome is a stuck `running` record as above.
-- `billed_cost_usd != authorized_cost_usd` is logged, not reconciled.
+- A process that dies between `RESERVE` and `SETTLE`/`REFUND` leaves the debit standing for up to
+  `REAP_AFTER_SECONDS`; a generation that legitimately runs longer than that is cancelled by the
+  reaper.
+- Redis retries are bounded (3 attempts); a longer outage leaves the record `running` for the
+  reaper.
 - Balance hashes have no TTL (≈120 B per user); idle expiry (`PERSIST` on mutation, `EXPIRE` on
   clean) is a documented extension.
 
 ## 5. Unresolved / future work
 
-- **O1. Reaper for stuck reservations.** `RESERVE` could `ZADD gen:inflight started_at id`;
-  `SETTLE`/`REFUND` `ZREM`; the flusher tick scans entries older than `REAP_AFTER` (e.g. 300 s)
-  and runs a refund guarded by `status == running`. A holder finishing after a reap sees `SETTLE`
-  return 0 and raises. `started_at` is already stored so this needs no schema change. Not built
-  within the 6–10 h budget.
 - **O2. Audit ledger in PostgreSQL** (`generation`, `top_up` tables) via the same flusher; gives
   durable history and a durable idempotency check for top-ups (rare enough to afford one read).
-- **O3. Retry wrappers** (3 attempts) around `settle` and `refund` for transient Redis errors.
 - **O4. Epoch-unique versions** to make a Redis data loss + reseed strictly monotonic instead of
   "self-healing on the next mutation".
 - **O5. Observability**: counters for CAS conflicts, cold loads, flush batch sizes;
@@ -233,3 +262,13 @@ or ping statements through the cursor). Multi-process workers report their own c
   vanished balance hash can never surface `nil` inside a Lua reply. `LOAD_WAIT_TIMEOUT_SECONDS`
   defaults to 15 s instead of 5 s so a losing cold-load caller outlives a crashed lock holder's
   `LOAD_LOCK_TTL_MS` (5 s) and gets a second attempt.
+- **Reaper, reconciliation, retries (second commit).** `gen:inflight` ZSET + `ReservationReaper`
+  run from the flusher tick (D16); `SETTLE` is CAS-capable and refunds the surplus LIFO, with the
+  authorization as a ceiling (D7); `settle`/`refund`/`forget_inflight` retry transient Redis errors
+  (D17); the refund loop moved into `ReservationRefunder` shared by the service and the reaper;
+  `GenerationService` raises `GenerationFailedError` when `SETTLE` reports `STALE` instead of
+  returning a refunded result. Found and fixed while testing: a redelivery of a finished
+  generation was denied by the policy when the balance had since dropped below the cost (D18).
+- **Charged amount clamped to `[0, authorized]`.** A provider bill below zero is treated like a
+  bill above the ceiling: logged and clamped, so `surplus_refund` can never hand back more than
+  the plan took.

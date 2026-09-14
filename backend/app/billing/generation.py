@@ -4,10 +4,12 @@ import asyncio
 import logging
 import random
 from dataclasses import dataclass
+from decimal import Decimal
 from time import monotonic, time
 
 from backend.app.billing.balance_loader import BalanceLoader
 from backend.app.billing.config import BillingConfig
+from backend.app.billing.refund import ReservationRefunder
 from backend.app.errors import (
     BalanceContentionError,
     GenerationFailedError,
@@ -24,13 +26,14 @@ from backend.app.shared.ports.billing.balance_store import (
     Missing,
     Reserved,
     Stale,
+    surplus_refund,
 )
 from backend.app.shared.ports.billing.generation_provider import GenerationProvider
 from backend.domain.generation import (
     MODELS,
     Authorization,
-    DebitPlan,
     DebitPolicyService,
+    GenerationAccessError,
     GenerationRequest,
     GenerationResult,
 )
@@ -45,6 +48,7 @@ class GenerationService:
     store: BalanceStore
     provider: GenerationProvider
     loader: BalanceLoader
+    refunder: ReservationRefunder
     config: BillingConfig
     policy: DebitPolicyService
 
@@ -60,29 +64,34 @@ class GenerationService:
                 request, authorized_cost_usd=authorization.estimated_cost_usd
             )
         except BaseException as exc:
-            await self._refund(
-                request, authorization.debit_plan, error=str(exc) or type(exc).__name__
+            await self.refunder.refund(
+                user_id=request.user_id,
+                client_request_id=request.client_request_id,
+                plan=authorization.debit_plan,
+                error=str(exc) or type(exc).__name__,
             )
             if isinstance(exc, Exception):
                 raise GenerationFailedError(message=str(exc)) from exc
             raise
-        settled = await self.store.settle(
-            request.client_request_id,
+        charged = await self._settle(request, authorization, result)
+        return GenerationResult(
+            client_request_id=request.client_request_id,
             content=result.content,
-            billed_cost_usd=result.billed_cost_usd,
+            billed_cost_usd=charged,
         )
-        if not settled:
-            logger.warning(
-                "generation %s settled without a running record; charge stands",
-                request.client_request_id,
-            )
-        return result
 
     async def _reserve(self, request: GenerationRequest) -> Authorization | GenerationResult:
         """Authorize against the current snapshot and debit it atomically; retry on CAS conflict."""
         snapshot = await self.loader.ensure_loaded(request.user_id)
         for attempt in range(self.config.RESERVE_MAX_ATTEMPTS):
-            authorization = self.policy.authorize(request, snapshot)
+            try:
+                authorization = self.policy.authorize(request, snapshot)
+            except GenerationAccessError as denied:
+                resolved = await self._denied_or_duplicate(request, denied)
+                if resolved is not None:
+                    return resolved
+                snapshot = await self.loader.ensure_loaded(request.user_id)
+                continue
             plan = authorization.debit_plan
             outcome = await self.store.reserve(
                 request=request,
@@ -107,6 +116,18 @@ class GenerationService:
                         return resolved
                     snapshot = await self.loader.ensure_loaded(request.user_id)
         raise BalanceContentionError(message="reservation retries exhausted")
+
+    async def _denied_or_duplicate(
+        self, request: GenerationRequest, denied: GenerationAccessError
+    ) -> GenerationResult | None:
+        """A redelivery keeps its cached outcome even if the balance has since dropped.
+
+        Only a genuinely new request is denied; the access error propagates for it.
+        """
+        record = (await self.store.get_generation(request.client_request_id)).value
+        if record is None:
+            raise denied
+        return await self._resolve_duplicate(request, record)
 
     async def _resolve_duplicate(
         self, request: GenerationRequest, record: GenerationRecord
@@ -135,21 +156,43 @@ class GenerationService:
                 return None
             record = fresh
 
-    async def _refund(self, request: GenerationRequest, plan: DebitPlan, *, error: str) -> None:
-        snapshot = await self.loader.ensure_loaded(request.user_id)
+    async def _settle(
+        self, request: GenerationRequest, authorization: Authorization, result: GenerationResult
+    ) -> Decimal:
+        """Mark the record done and give back whatever the provider billed below the plan.
+
+        The authorized plan is a ceiling: a provider bill above it is capped, never charged.
+        Returns the amount actually charged.
+        """
+        plan = authorization.debit_plan
+        charged = max(Decimal(0), min(result.billed_cost_usd, plan.total_usd))
+        if not Decimal(0) <= result.billed_cost_usd <= plan.total_usd:
+            logger.warning(
+                "generation %s billed %s outside [0, authorized %s]; charging the clamped amount",
+                request.client_request_id,
+                result.billed_cost_usd,
+                plan.total_usd,
+            )
+        refund = surplus_refund(plan, authorization.debit_policy, result.billed_cost_usd)
+        snapshot = await self.loader.ensure_loaded(request.user_id) if refund.total_usd else None
         for _ in range(self.config.RESERVE_MAX_ATTEMPTS):
-            outcome = await self.store.refund(
+            outcome = await self.store.settle(
                 user_id=request.user_id,
                 client_request_id=request.client_request_id,
-                expected_version=snapshot.version,
-                new=snapshot.refund_plan(plan),
-                error=error,
+                content=result.content,
+                billed_cost_usd=charged,
+                provider_billed_cost_usd=result.billed_cost_usd,
+                refunded_surplus_usd=refund.total_usd,
+                expected_version=snapshot.version if snapshot is not None else None,
+                new=snapshot.refund_plan(refund) if snapshot is not None else None,
             )
             match outcome:
-                case Applied() | Stale():
-                    return
+                case Applied():
+                    return charged
+                case Stale():
+                    raise GenerationFailedError(message="reservation was reaped before settle")
                 case Conflict(current=current):
                     snapshot = current
                 case Missing():
                     snapshot = await self.loader.ensure_loaded(request.user_id)
-        raise BalanceContentionError(message="refund retries exhausted")
+        raise BalanceContentionError(message="settle retries exhausted")
