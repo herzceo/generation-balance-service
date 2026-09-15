@@ -14,7 +14,10 @@ from .balance_store import (
     SettleOutcome,
     Stale,
     TopUpOutcome,
+    micros_to_money,
+    money_to_micros,
     money_to_str,
+    quantize_money,
     str_to_money,
     surplus_refund,
 )
@@ -37,7 +40,10 @@ __all__ = (
     "SettleOutcome",
     "Stale",
     "TopUpOutcome",
+    "micros_to_money",
+    "money_to_micros",
     "money_to_str",
+    "quantize_money",
     "str_to_money",
     "surplus_refund",
 )

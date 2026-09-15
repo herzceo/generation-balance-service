@@ -8,6 +8,7 @@ from time import monotonic
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID, uuid4
 
+from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import event
 
 from backend.app.billing import BalanceFlusher, BalanceService, GenerationService, ReservationReaper
@@ -197,3 +198,36 @@ def split_results[T](results: list[T | BaseException]) -> tuple[list[T], list[Ba
     ok = [r for r in results if not isinstance(r, BaseException)]
     errors = [r for r in results if isinstance(r, BaseException)]
     return ok, errors
+
+
+@dataclass
+class FlakyScript:
+    """Counts how many times a patched Lua script was invoked."""
+
+    calls: int = 0
+
+
+def drop_reply_once(store: BalanceStore, script: str, *, after_landing: bool) -> FlakyScript:
+    """Make the first call to one Lua script look like a dropped connection.
+
+    ``after_landing`` decides whether the script actually ran before the reply was lost, which is
+    the case the retry has to recognise instead of applying the operation twice.
+    """
+    impl = cast("Any", store)
+    original = cast("Callable[..., Awaitable[Any]]", getattr(impl, script))
+    flaky = FlakyScript()
+
+    async def patched(**kwargs: Any) -> Any:
+        flaky.calls += 1
+        first = flaky.calls == 1
+        if first and not after_landing:
+            msg = "connection dropped before the script ran"
+            raise RedisConnectionError(msg)
+        reply = await original(**kwargs)
+        if first:
+            msg = "connection dropped after the script ran"
+            raise RedisConnectionError(msg)
+        return reply
+
+    setattr(impl, script, patched)
+    return flaky

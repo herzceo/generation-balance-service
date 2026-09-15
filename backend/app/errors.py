@@ -25,11 +25,6 @@ class DetailedError(ApplicationError):
         return self.message
 
 
-class NotFoundError(DetailedError):
-    _default_message = "Not found"
-    _default_code = "not_found"
-
-
 class InvalidInputError(DetailedError):
     _default_message = "Invalid input"
     _default_code = "invalid_input"

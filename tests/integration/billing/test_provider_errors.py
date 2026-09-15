@@ -18,9 +18,12 @@ from tests.integration.billing.helpers import (
     seed_pg_balance,
     split_results,
 )
+from tests.integration.billing.ioc import create_test_container, fast_billing_config
 
 if TYPE_CHECKING:
     from dishka import AsyncContainer
+    from redis.asyncio import Redis
+    from sqlalchemy.ext.asyncio import AsyncEngine
 
     from backend.app.shared.ports.billing import BalanceStore
     from backend.domain.generation import FakeGenerationProvider
@@ -103,3 +106,35 @@ async def test_provider_failure_does_not_block_other_dialogs(
     assert balance is not None
     assert balance.paid_usd == Decimal("0.92")
     assert provider.get_stats().max_active_calls >= 2
+
+
+async def test_provider_slower_than_timeout_is_abandoned_and_refunded(
+    engine: AsyncEngine, redis: Redis, provider: FakeGenerationProvider, store: BalanceStore
+) -> None:
+    user_id = uuid4()
+    impatient = create_test_container(
+        engine=engine,
+        redis=redis,
+        provider=provider,
+        billing_config=fast_billing_config(PROVIDER_TIMEOUT_SECONDS=0.1),
+    )
+    try:
+        await seed_pg_balance(impatient, user_id, paid_usd=Decimal("1.00"))
+        request = basic_request(user_id)
+        provider.set_scenario(request.client_request_id, ProviderScenario(delay_seconds=1.0))
+
+        with pytest.raises(GenerationFailedError):
+            await run_generation(impatient, request)
+    finally:
+        await impatient.close()
+
+    balance = await read_redis_balance(store, user_id)
+    assert balance is not None
+    assert balance.paid_usd == Decimal("1.00")
+    assert balance.version == 2
+    record = (await store.get_generation(request.client_request_id)).value
+    assert record is not None
+    assert record.status is GenerationStatus.FAILED
+    assert record.error == "TimeoutError"
+    assert await redis.zcard("gen:inflight") == 0
+    assert provider.get_stats().calls[request.client_request_id] == 1

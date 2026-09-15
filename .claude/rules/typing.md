@@ -82,7 +82,7 @@ async def get_by_user_id(self, user_id: UUID, /, *, strict: Literal[False] = ...
 async def get_by_user_id(self, user_id: UUID, /, *, strict: bool = False) -> Balance | Option[Balance]:
     result = Option(await self._fetch(user_id))
     if strict:
-        return result.some(NotFoundError())
+        return result.some(InvalidInputError(message="unknown user"))
     return result
 ```
 

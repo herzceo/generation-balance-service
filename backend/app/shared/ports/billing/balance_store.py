@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
@@ -11,6 +11,8 @@ from uuid import UUID
 from backend.domain.generation import BalanceTopUp, DebitPlan, DebitPolicy, GenerationRequest
 from backend.internal import Option
 from backend.internal.dto import StructDTO
+
+MONEY_QUANTUM = Decimal("0.000001")
 
 
 def money_to_str(amount: Decimal) -> str:
@@ -21,6 +23,24 @@ def str_to_money(raw: str) -> Decimal:
     return Decimal(raw)
 
 
+def quantize_money(amount: Decimal) -> Decimal:
+    """Round down to the six decimals PostgreSQL stores, so Redis and the row cannot diverge."""
+    return amount.quantize(MONEY_QUANTUM, rounding=ROUND_DOWN)
+
+
+def money_to_micros(amount: Decimal) -> int:
+    """Integer micro-dollars; anything finer than ``MONEY_QUANTUM`` is a caller bug."""
+    scaled = amount.scaleb(6)
+    if scaled != scaled.to_integral_value():
+        msg = f"{amount} is finer than {MONEY_QUANTUM}"
+        raise ValueError(msg)
+    return int(scaled)
+
+
+def micros_to_money(micros: int) -> Decimal:
+    return Decimal(micros).scaleb(-6)
+
+
 _CHARGE_ORDER: dict[DebitPolicy, tuple[str, ...]] = {
     DebitPolicy.PAID_ONLY: ("paid",),
     DebitPolicy.PAID_THEN_FREE_THEN_BONUS: ("paid", "free", "bonus"),
@@ -29,12 +49,7 @@ _CHARGE_ORDER: dict[DebitPolicy, tuple[str, ...]] = {
 
 
 def surplus_refund(plan: DebitPlan, policy: DebitPolicy, billed_cost_usd: Decimal) -> DebitPlan:
-    """Amounts to give back when the provider billed less than the authorized plan.
-
-    The authorization is a ceiling: billing above it is capped, never charged. The surplus is
-    returned LIFO along the policy's charge order, so the bucket charged last is refunded first.
-    ``free_requests`` are never refunded here.
-    """
+    """Unbilled part of the plan, returned LIFO along the charge order; ``free_requests`` stay."""
     charged = {"free": plan.free_usd, "bonus": plan.bonus_usd, "paid": plan.paid_usd}
     remaining = plan.total_usd - max(Decimal(0), min(billed_cost_usd, plan.total_usd))
     refund = {"free": Decimal(0), "bonus": Decimal(0), "paid": Decimal(0)}
@@ -66,33 +81,6 @@ class BalanceSnapshot(StructDTO, kw_only=True):
             version=0,
         )
 
-    def apply_plan(self, plan: DebitPlan) -> BalanceSnapshot:
-        return BalanceSnapshot(
-            free_usd=self.free_usd - plan.free_usd,
-            bonus_usd=self.bonus_usd - plan.bonus_usd,
-            paid_usd=self.paid_usd - plan.paid_usd,
-            free_requests=self.free_requests - plan.free_requests,
-            version=self.version,
-        )
-
-    def refund_plan(self, plan: DebitPlan) -> BalanceSnapshot:
-        return BalanceSnapshot(
-            free_usd=self.free_usd + plan.free_usd,
-            bonus_usd=self.bonus_usd + plan.bonus_usd,
-            paid_usd=self.paid_usd + plan.paid_usd,
-            free_requests=self.free_requests + plan.free_requests,
-            version=self.version,
-        )
-
-    def apply_top_up(self, top_up: BalanceTopUp) -> BalanceSnapshot:
-        return BalanceSnapshot(
-            free_usd=self.free_usd,
-            bonus_usd=self.bonus_usd + top_up.bonus_usd,
-            paid_usd=self.paid_usd + top_up.paid_usd,
-            free_requests=self.free_requests + top_up.free_requests,
-            version=self.version,
-        )
-
 
 class GenerationStatus(StrEnum):
     RUNNING = "running"
@@ -116,8 +104,7 @@ class GenerationRecord(StructDTO, kw_only=True):
 
 
 @dataclass(frozen=True, slots=True)
-class Reserved:
-    version: int
+class Reserved: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,13 +134,13 @@ class Stale: ...
 
 
 type ReserveOutcome = Reserved | Conflict | Missing | Duplicate
-type SettleOutcome = Applied | Conflict | Missing | Stale
-type RefundOutcome = Applied | Conflict | Missing | Stale
-type TopUpOutcome = Applied | Conflict | Missing | AlreadyApplied
+type SettleOutcome = Applied | AlreadyApplied | Missing | Stale
+type RefundOutcome = Applied | Missing | Stale
+type TopUpOutcome = Applied | Missing | AlreadyApplied
 
 
 class BalanceStore(Protocol):
-    """Hot balance store. Every mutation is a compare-and-set on the per-user ``version``."""
+    """Hot balance store: ``reserve`` is a CAS on ``version``, every other mutation is additive."""
 
     @abstractmethod
     async def load(self, user_id: UUID) -> Option[BalanceSnapshot]: ...
@@ -165,10 +152,19 @@ class BalanceStore(Protocol):
     async def seed_if_absent(self, user_id: UUID, snapshot: BalanceSnapshot) -> bool: ...
 
     @abstractmethod
-    async def try_acquire_load_lock(self, user_id: UUID) -> bool: ...
+    async def try_acquire_load_lock(self, user_id: UUID) -> str | None:
+        """Return the owner token of the acquired lock, or ``None`` when someone else holds it."""
+        ...
 
     @abstractmethod
-    async def release_load_lock(self, user_id: UUID) -> None: ...
+    async def release_load_lock(self, user_id: UUID, token: str) -> None:
+        """Delete the lock only while ``token`` still holds it."""
+        ...
+
+    @abstractmethod
+    async def advance_version(self, user_id: UUID, *, expected: int, to: int) -> bool:
+        """CAS ``version`` from ``expected`` to ``to`` and mark the user dirty."""
+        ...
 
     @abstractmethod
     async def reserve(
@@ -176,11 +172,12 @@ class BalanceStore(Protocol):
         *,
         request: GenerationRequest,
         expected_version: int,
-        new: BalanceSnapshot,
         plan: DebitPlan,
         authorized_cost_usd: Decimal,
         started_at: float,
-    ) -> ReserveOutcome: ...
+    ) -> ReserveOutcome:
+        """Debit ``plan`` if ``version`` still equals ``expected_version``; create the record."""
+        ...
 
     @abstractmethod
     async def get_generation(self, client_request_id: UUID) -> Option[GenerationRecord]: ...
@@ -194,33 +191,22 @@ class BalanceStore(Protocol):
         content: str,
         billed_cost_usd: Decimal,
         provider_billed_cost_usd: Decimal,
-        refunded_surplus_usd: Decimal,
-        expected_version: int | None,
-        new: BalanceSnapshot | None,
+        refund: DebitPlan,
     ) -> SettleOutcome:
-        """Mark the record done; with ``expected_version``/``new`` also refund a surplus by CAS."""
+        """Mark the record done and add ``refund`` (the unbilled part of the plan) back."""
         ...
 
     @abstractmethod
     async def refund(
-        self,
-        *,
-        user_id: UUID,
-        client_request_id: UUID,
-        expected_version: int,
-        new: BalanceSnapshot,
-        error: str,
-    ) -> RefundOutcome: ...
+        self, *, user_id: UUID, client_request_id: UUID, plan: DebitPlan, error: str
+    ) -> RefundOutcome:
+        """Add the reserved ``plan`` back and mark the record failed; no-op unless running."""
+        ...
 
     @abstractmethod
-    async def top_up(
-        self,
-        *,
-        operation_id: UUID,
-        user_id: UUID,
-        expected_version: int,
-        new: BalanceSnapshot,
-    ) -> TopUpOutcome: ...
+    async def top_up(self, command: BalanceTopUp) -> TopUpOutcome:
+        """Add the top-up once per ``operation_id``."""
+        ...
 
     @abstractmethod
     async def stale_inflight(self, *, older_than: float, limit: int) -> list[UUID]: ...

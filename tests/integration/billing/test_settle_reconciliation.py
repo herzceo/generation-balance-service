@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import TYPE_CHECKING
 from uuid import uuid4
-
-from redis.exceptions import ConnectionError as RedisConnectionError
 
 from backend.app.shared.ports.billing import BalanceStore, GenerationStatus
 from tests.integration.billing.helpers import (
     ScaledProvider,
     assert_non_negative,
     basic_request,
+    flush_once,
     get_balance,
+    read_pg_balance,
     run_generation,
     seed_pg_balance,
     split_results,
@@ -29,9 +30,9 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
     from backend.domain.generation import FakeGenerationProvider
-    from backend.infra.database.redis.adapters import ImplRedisBalanceStore
 
 
+@asynccontextmanager
 async def _scaled(
     engine: AsyncEngine, redis: Redis, provider: FakeGenerationProvider, **kwargs: Any
 ) -> AsyncIterator[AsyncContainer]:
@@ -48,7 +49,7 @@ async def test_billed_below_authorized_refunds_surplus_lifo(
     engine: AsyncEngine, redis: Redis, provider: FakeGenerationProvider, store: BalanceStore
 ) -> None:
     user_id = uuid4()
-    async for container in _scaled(engine, redis, provider, override=Decimal("0.03")):
+    async with _scaled(engine, redis, provider, override=Decimal("0.03")) as container:
         await seed_pg_balance(
             container, user_id, free_usd=Decimal("0.05"), paid_usd=Decimal("0.03")
         )
@@ -71,7 +72,7 @@ async def test_billed_above_authorized_is_capped(
     engine: AsyncEngine, redis: Redis, provider: FakeGenerationProvider, store: BalanceStore
 ) -> None:
     user_id = uuid4()
-    async for container in _scaled(engine, redis, provider, override=Decimal("0.50")):
+    async with _scaled(engine, redis, provider, override=Decimal("0.50")) as container:
         await seed_pg_balance(container, user_id, paid_usd=Decimal("1.00"))
         request = basic_request(user_id, model_name="premium")
         result = await run_generation(container, request)
@@ -89,7 +90,7 @@ async def test_redelivery_after_surplus_refund_returns_charged_amount(
     engine: AsyncEngine, redis: Redis, provider: FakeGenerationProvider
 ) -> None:
     user_id = uuid4()
-    async for container in _scaled(engine, redis, provider, override=Decimal("0.03")):
+    async with _scaled(engine, redis, provider, override=Decimal("0.03")) as container:
         await seed_pg_balance(
             container, user_id, free_usd=Decimal("0.05"), paid_usd=Decimal("0.03")
         )
@@ -107,7 +108,7 @@ async def test_surplus_settle_concurrent_with_generations_keeps_balance_exact(
     engine: AsyncEngine, redis: Redis, provider: FakeGenerationProvider
 ) -> None:
     user_id = uuid4()
-    async for container in _scaled(engine, redis, provider, factor=Decimal("0.5")):
+    async with _scaled(engine, redis, provider, factor=Decimal("0.5")) as container:
         await seed_pg_balance(container, user_id, paid_usd=Decimal("10.00"))
         requests = [basic_request(user_id) for _ in range(11)]
         results = await asyncio.gather(
@@ -123,30 +124,25 @@ async def test_surplus_settle_concurrent_with_generations_keeps_balance_exact(
         assert Decimal("10.00") - total_usd(balance) == sum(r.billed_cost_usd for r in ok)
 
 
-async def test_settle_survives_transient_redis_error(
-    container: AsyncContainer, store: BalanceStore, provider: FakeGenerationProvider
+async def test_bill_with_more_than_six_decimals_is_quantized_and_flushes_identically(
+    engine: AsyncEngine, redis: Redis, provider: FakeGenerationProvider, store: BalanceStore
 ) -> None:
     user_id = uuid4()
-    await seed_pg_balance(container, user_id, paid_usd=Decimal("1.00"))
-    impl: ImplRedisBalanceStore = store  # type: ignore[assignment]
-    original = impl._settle
-    calls = 0
+    async with _scaled(engine, redis, provider, override=Decimal("0.0266666666")) as container:
+        await seed_pg_balance(container, user_id, paid_usd=Decimal("1.00"))
+        request = basic_request(user_id)
 
-    async def flaky(**kwargs: Any) -> Any:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            msg = "connection dropped"
-            raise RedisConnectionError(msg)
-        return await original(**kwargs)
+        result = await run_generation(container, request)
 
-    impl._settle = flaky  # type: ignore[assignment]
-    request = basic_request(user_id)
-    result = await run_generation(container, request)
+        assert result.billed_cost_usd == Decimal("0.026666")
+        snapshot = await get_balance(container, user_id)
+        assert snapshot.paid_usd == Decimal("0.973334")
+        record = (await store.get_generation(request.client_request_id)).value
+        assert record is not None
+        assert record.provider_billed_cost_usd == Decimal("0.0266666666")
 
-    assert calls == 2
-    assert result.billed_cost_usd == Decimal("0.08")
-    record = (await store.get_generation(request.client_request_id)).value
-    assert record is not None
-    assert record.status is GenerationStatus.DONE
-    assert (await get_balance(container, user_id)).paid_usd == Decimal("0.92")
+        assert await flush_once(container) == 1
+        row = await read_pg_balance(container, user_id)
+        assert row is not None
+        assert row.paid_usd == snapshot.paid_usd
+        assert row.version == snapshot.version

@@ -10,5 +10,8 @@ class BillingConfig(StructDTO):
     LOAD_WAIT_TIMEOUT_SECONDS: float = 15.0
     FLUSH_INTERVAL_SECONDS: float = 1.0
     FLUSH_BATCH_SIZE: int = 500
+    # Must stay below REAP_AFTER_SECONDS: a slow provider is then abandoned and refunded by its
+    # own caller, never reaped underneath a call that is about to settle.
+    PROVIDER_TIMEOUT_SECONDS: float = 240.0
     REAP_AFTER_SECONDS: float = 300.0
     REAP_BATCH_SIZE: int = 100

@@ -13,45 +13,33 @@ if TYPE_CHECKING:
 
 @final
 class ImplDatabase(Database):
-    __slots__ = ("_session", "_txn_stack")
+    __slots__ = ("_session", "_txn")
 
     def __init__(self, session_maker: async_sessionmaker[AsyncSession]) -> None:
         self._session: AsyncSession = session_maker()
-        self._txn_stack: list[AsyncSessionTransaction] = []
+        self._txn: AsyncSessionTransaction | None = None
 
     async def close(self) -> None:
         await self._session.close()
 
     @property
     def gateway(self) -> ImplRepoGateway:
-        if not self._txn_stack:
+        if self._txn is None:
             msg = "Database.gateway accessed outside of an `async with db:` block"
             raise RuntimeError(msg)
         return ImplRepoGateway(self._session)
 
-    def _assert_active(self) -> None:
-        if not self._txn_stack:
-            msg = "Database.commit()/rollback()/flush() called outside of an `async with db:` block"
-            raise RuntimeError(msg)
-
     async def commit(self) -> None:
-        self._assert_active()
-        await self._txn_stack[-1].commit()
-
-    async def rollback(self) -> None:
-        self._assert_active()
-        await self._txn_stack[-1].rollback()
-
-    async def flush(self) -> None:
-        self._assert_active()
-        await self._session.flush()
+        if self._txn is None:
+            msg = "Database.commit() called outside of an `async with db:` block"
+            raise RuntimeError(msg)
+        await self._txn.commit()
 
     async def __aenter__(self) -> Self:
-        if not self._txn_stack:
-            txn = await self._session.begin()
-        else:
-            txn = await self._session.begin_nested()
-        self._txn_stack.append(txn)
+        if self._txn is not None:
+            msg = "Database does not support nested `async with db:` blocks"
+            raise RuntimeError(msg)
+        self._txn = await self._session.begin()
         return self
 
     async def __aexit__(
@@ -60,8 +48,7 @@ class ImplDatabase(Database):
         exc_val: BaseException | None,
         exc_tb: object,
     ) -> None:
-        txn = self._txn_stack.pop()
-        if txn.is_active:
-            if not self._txn_stack:
-                self._session.expunge_all()
+        txn, self._txn = self._txn, None
+        if txn is not None and txn.is_active:
+            self._session.expunge_all()
             await txn.rollback()

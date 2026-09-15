@@ -21,13 +21,13 @@ class ImplBalanceRepo(BalanceRepo):
         result = await self._session.execute(select(Balance).where(Balance.user_id == user_id))
         return Option(result.scalar_one_or_none())
 
-    async def upsert_many(self, balances: list[Balance]) -> None:
+    async def upsert_many(self, balances: list[Balance]) -> set[UUID]:
         if not balances:
-            return
+            return set()
         # Sorted by primary key so concurrent flushers never deadlock on row order.
         rows = [b.to_builtins() for b in sorted(balances, key=lambda b: b.user_id)]
         stmt = insert(Balance).values(rows)
-        stmt = stmt.on_conflict_do_update(
+        upsert = stmt.on_conflict_do_update(
             index_elements=[Balance.user_id],
             set_={
                 "free_usd": stmt.excluded.free_usd,
@@ -38,5 +38,6 @@ class ImplBalanceRepo(BalanceRepo):
                 "updated_at": func.now(),
             },
             where=stmt.excluded.version > Balance.version,
-        )
-        await self._session.execute(stmt)
+        ).returning(Balance.user_id)
+        result = await self._session.execute(upsert)
+        return set(result.scalars().all())

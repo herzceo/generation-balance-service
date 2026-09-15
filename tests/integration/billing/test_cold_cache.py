@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 
 from backend.domain.generation import BalanceTopUp, FreeRequestsExhaustedError
+from backend.infra.database.redis.adapters.balance_store import load_lock_key
 from tests.integration.billing.helpers import (
     basic_request,
     flush_once,
@@ -20,6 +21,7 @@ from tests.integration.billing.helpers import (
 
 if TYPE_CHECKING:
     from dishka import AsyncContainer
+    from redis.asyncio import Redis
 
     from backend.app.shared.ports.billing import BalanceStore
     from tests.integration.billing.helpers import PgCounter
@@ -88,3 +90,18 @@ async def test_user_without_pg_row_starts_at_zero(
     assert row is not None
     assert row.paid_usd == Decimal("1.00")
     assert row.version == 1
+
+
+async def test_load_lock_is_released_only_by_its_owner(store: BalanceStore, redis: Redis) -> None:
+    user_id = uuid4()
+    token = await store.try_acquire_load_lock(user_id)
+    assert token is not None
+    assert await store.try_acquire_load_lock(user_id) is None
+
+    # The lock TTL expires mid-load and another process takes it over.
+    await redis.set(load_lock_key(user_id), "another-holder")
+    await store.release_load_lock(user_id, token)
+    assert await redis.get(load_lock_key(user_id)) == "another-holder"
+
+    await store.release_load_lock(user_id, "another-holder")
+    assert await redis.get(load_lock_key(user_id)) is None

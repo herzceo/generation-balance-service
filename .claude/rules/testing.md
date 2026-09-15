@@ -7,9 +7,11 @@ paths:
 
 ## Test type decision
 
-**Unit tests** (`tests/unit/`): pure logic with no I/O — `Option[T]` (`tests/unit/internal/`) and the
-value-object arithmetic of `BalanceSnapshot` / money serialisation (`tests/unit/billing/`). If a
-test needs Redis, PostgreSQL or the provider, it is an integration test.
+**Unit tests** (`tests/unit/`): pure logic with no I/O — `Option[T]` (`tests/unit/internal/`), the
+value-object arithmetic of `BalanceSnapshot` / money serialisation and quantisation
+(`tests/unit/billing/`), env config loading (`tests/unit/main/`) and container wiring
+(`tests/unit/entry/`; engines and Redis clients are lazy, so building a container connects to
+nothing). If a test needs Redis, PostgreSQL or the provider, it is an integration test.
 
 **Integration tests** (`tests/integration/`): everything else. Real PostgreSQL + real Redis via
 testcontainers, the real `FakeGenerationProvider` from the given module. Nothing is mocked. This
@@ -23,9 +25,13 @@ Never write unit tests for services, the Redis adapter, the repository or the fl
 tests/
 ├── unit/
 │   ├── internal/test_option.py
-│   └── billing/{test_balance_snapshot.py, test_surplus_refund.py}
+│   ├── billing/{test_balance_snapshot.py, test_surplus_refund.py}
+│   ├── entry/test_ioc.py      # every process's container builds (Dishka validates the whole graph)
+│   └── main/test_load_from_env.py
 └── integration/
     ├── conftest.py            # session: postgres_url (alembic upgrade head), redis_url, manager
+    │                          #   env.py runs fileConfig(..., disable_existing_loggers=False) so
+    │                          #   app loggers created before the migration still reach caplog
     ├── test_migrations.py     # compare_metadata(...) == []
     └── billing/
         ├── conftest.py        # function: shared_state, provider, engine, redis, container, store, pg_counter
@@ -40,8 +46,9 @@ tests/
         ├── test_pg_budget.py
         ├── test_convergence.py
         ├── test_multiprocess.py
-        ├── test_settle_reconciliation.py   # ScaledProvider: billed below/above authorized, Redis retry
-        └── test_reaper.py                  # stale reservation refunded, inflight index hygiene
+        ├── test_settle_reconciliation.py   # ScaledProvider: billed below/above authorized, quantisation
+        ├── test_reaper.py                  # stale reservation refunded, inflight index hygiene
+        └── test_transport_retries.py       # a script landed, its reply was lost, the call is retried
 ```
 
 ## Fixture scopes
@@ -137,6 +144,22 @@ Examples: `test_generation_basic_with_paid_balance_debits_paid`,
 
 Don't name tests after internals (`test_reserve_script_returns_conflict` is wrong).
 
+## A fix's test must fail without the fix
+
+Write the test, then break the fix and watch it go red before keeping either. Copy the file aside,
+revert the one line, run that test, restore. A test that is green both ways documents behaviour
+nobody broke; it does not protect the fix. This matters most for the retry and CAS paths, where
+the wrong outcome is a plausible-looking success.
+
+## Every process gets a wiring test
+
+Dishka validates the entire graph when the container is built, so a REQUEST factory whose
+dependency has no provider breaks the container for callers that never ask for that factory. Each
+entry point in `main/cli.py` therefore needs a `tests/unit/entry/` test that builds its container
+exactly as the process does and resolves the object the process resolves. Nothing else catches a
+process that cannot start: integration tests always pass a provider, so they never exercise the
+flusher's wiring.
+
 ## What NOT to test
 
 - Framework behaviour: SQLAlchemy, redis-py, Dishka
@@ -151,6 +174,7 @@ Required scenarios (each already has a file): single requests per policy branch,
 requests with funds for exactly K, in-flight and post-completion redelivery, provider failures
 (refund, cached failure), top-up idempotency and concurrency with generations, cold cache (balance
 in PostgreSQL only), PostgreSQL statement budget, Redis/PostgreSQL convergence, multi-process
-execution and cross-process redelivery, schema drift.
+execution and cross-process redelivery, transport retries after a landed script, schema drift,
+container wiring per process.
 
 Aim for meaningful invariants, not line coverage percentage.

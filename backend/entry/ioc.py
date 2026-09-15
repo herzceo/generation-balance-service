@@ -52,14 +52,16 @@ def create_infra_provider(
     return provider
 
 
-def create_billing_provider() -> Provider:
+def create_billing_provider(*, with_generation: bool) -> Provider:
+    """Dishka validates the graph up front, so ``GenerationService`` needs a provider to exist."""
     provider = Provider(scope=Scope.REQUEST)
     provider.provide(BalanceLoader, provides=BalanceLoader)
     provider.provide(ReservationRefunder, provides=ReservationRefunder)
     provider.provide(ReservationReaper, provides=ReservationReaper)
-    provider.provide(GenerationService, provides=GenerationService)
     provider.provide(BalanceService, provides=BalanceService)
     provider.provide(BalanceFlusher, provides=BalanceFlusher)
+    if with_generation:
+        provider.provide(GenerationService, provides=GenerationService)
     return provider
 
 
@@ -84,7 +86,7 @@ def create_container(
             billing_config=billing_config,
             store_config=store_config or RedisBalanceStoreConfig(),
         ),
-        create_billing_provider(),
+        create_billing_provider(with_generation=provider is not None),
     ]
     if provider is not None:
         providers.append(create_provider_provider(provider))

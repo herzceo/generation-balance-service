@@ -17,8 +17,6 @@ class Database(Protocol):
     @property
     def gateway(self) -> RepoGateway: ...
     async def commit(self) -> None: ...
-    async def rollback(self) -> None: ...
-    async def flush(self) -> None: ...
     async def __aenter__(self) -> Self: ...
     async def __aexit__(...) -> None: ...
 ```
@@ -39,8 +37,9 @@ async def flush_once(self) -> int:
 - `async with self.db:` opens a session/transaction
 - `await self.db.commit()` commits explicitly -- no auto-commit; commit after reads too, so the
   connection is released promptly
-- Session auto-closes on `__aexit__`
-- Supports nested transactions via `begin_nested()`
+- Leaving the block without `commit()` rolls the transaction back
+- One level only: re-entering `async with db:` raises. Add savepoints when a use case needs them,
+  not in advance
 - Skip the block entirely when there is nothing to write (an empty flush costs zero statements)
 
 ## Gateway Access
@@ -75,9 +74,13 @@ stmt = stmt.on_conflict_do_update(
     index_elements=[Balance.user_id],
     set_={..., "version": stmt.excluded.version, "updated_at": func.now()},
     where=stmt.excluded.version > Balance.version,   # strict >: stale snapshots are rejected
-)
-await self._session.execute(stmt)
+).returning(Balance.user_id)                          # the flusher learns which rows were accepted
+return set((await self._session.execute(upsert)).scalars().all())
 ```
+
+A rejected row is either another flusher's newer write (harmless) or a hot store that restarted
+behind PostgreSQL; the flusher tells them apart by comparing the PG row with its snapshot and
+`advance_version`s Redis past the row in the second case (see `app/billing/flusher.py`).
 
 Custom reads use SQLAlchemy `select()` and return `Option`:
 

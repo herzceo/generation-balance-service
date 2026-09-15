@@ -17,6 +17,7 @@ from backend.app.errors import (
     InvalidInputError,
 )
 from backend.app.shared.ports.billing.balance_store import (
+    AlreadyApplied,
     Applied,
     BalanceStore,
     Conflict,
@@ -26,6 +27,7 @@ from backend.app.shared.ports.billing.balance_store import (
     Missing,
     Reserved,
     Stale,
+    quantize_money,
     surplus_refund,
 )
 from backend.app.shared.ports.billing.generation_provider import GenerationProvider
@@ -60,18 +62,20 @@ class GenerationService:
             return reserved
         authorization = reserved
         try:
-            result = await self.provider.generate(
-                request, authorized_cost_usd=authorization.estimated_cost_usd
-            )
+            async with asyncio.timeout(self.config.PROVIDER_TIMEOUT_SECONDS):
+                result = await self.provider.generate(
+                    request, authorized_cost_usd=authorization.estimated_cost_usd
+                )
         except BaseException as exc:
+            reason = str(exc) or type(exc).__name__
             await self.refunder.refund(
                 user_id=request.user_id,
                 client_request_id=request.client_request_id,
                 plan=authorization.debit_plan,
-                error=str(exc) or type(exc).__name__,
+                error=reason,
             )
             if isinstance(exc, Exception):
-                raise GenerationFailedError(message=str(exc)) from exc
+                raise GenerationFailedError(message=reason) from exc
             raise
         charged = await self._settle(request, authorization, result)
         return GenerationResult(
@@ -92,12 +96,10 @@ class GenerationService:
                     return resolved
                 snapshot = await self.loader.ensure_loaded(request.user_id)
                 continue
-            plan = authorization.debit_plan
             outcome = await self.store.reserve(
                 request=request,
                 expected_version=snapshot.version,
-                new=snapshot.apply_plan(plan),
-                plan=plan,
+                plan=authorization.debit_plan,
                 authorized_cost_usd=authorization.estimated_cost_usd,
                 started_at=time(),
             )
@@ -120,10 +122,7 @@ class GenerationService:
     async def _denied_or_duplicate(
         self, request: GenerationRequest, denied: GenerationAccessError
     ) -> GenerationResult | None:
-        """A redelivery keeps its cached outcome even if the balance has since dropped.
-
-        Only a genuinely new request is denied; the access error propagates for it.
-        """
+        """A redelivery keeps its cached outcome even if the balance has since dropped."""
         record = (await self.store.get_generation(request.client_request_id)).value
         if record is None:
             raise denied
@@ -159,13 +158,9 @@ class GenerationService:
     async def _settle(
         self, request: GenerationRequest, authorization: Authorization, result: GenerationResult
     ) -> Decimal:
-        """Mark the record done and give back whatever the provider billed below the plan.
-
-        The authorized plan is a ceiling: a provider bill above it is capped, never charged.
-        Returns the amount actually charged.
-        """
+        """Mark the record done and refund the unbilled part of the plan; returns the charge."""
         plan = authorization.debit_plan
-        charged = max(Decimal(0), min(result.billed_cost_usd, plan.total_usd))
+        charged = quantize_money(max(Decimal(0), min(result.billed_cost_usd, plan.total_usd)))
         if not Decimal(0) <= result.billed_cost_usd <= plan.total_usd:
             logger.warning(
                 "generation %s billed %s outside [0, authorized %s]; charging the clamped amount",
@@ -173,8 +168,7 @@ class GenerationService:
                 result.billed_cost_usd,
                 plan.total_usd,
             )
-        refund = surplus_refund(plan, authorization.debit_policy, result.billed_cost_usd)
-        snapshot = await self.loader.ensure_loaded(request.user_id) if refund.total_usd else None
+        refund = surplus_refund(plan, authorization.debit_policy, charged)
         for _ in range(self.config.RESERVE_MAX_ATTEMPTS):
             outcome = await self.store.settle(
                 user_id=request.user_id,
@@ -182,17 +176,13 @@ class GenerationService:
                 content=result.content,
                 billed_cost_usd=charged,
                 provider_billed_cost_usd=result.billed_cost_usd,
-                refunded_surplus_usd=refund.total_usd,
-                expected_version=snapshot.version if snapshot is not None else None,
-                new=snapshot.refund_plan(refund) if snapshot is not None else None,
+                refund=refund,
             )
             match outcome:
-                case Applied():
+                case Applied() | AlreadyApplied():
                     return charged
                 case Stale():
                     raise GenerationFailedError(message="reservation was reaped before settle")
-                case Conflict(current=current):
-                    snapshot = current
                 case Missing():
-                    snapshot = await self.loader.ensure_loaded(request.user_id)
+                    await self.loader.ensure_loaded(request.user_id)
         raise BalanceContentionError(message="settle retries exhausted")

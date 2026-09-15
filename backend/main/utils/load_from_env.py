@@ -1,4 +1,3 @@
-from ast import literal_eval
 from collections.abc import Callable, Mapping
 from os import environ
 from typing import Any
@@ -20,7 +19,7 @@ def _convert_to_dto[C: dto_types.FromBuiltinsSupported](
     dto_data: dict[str, Any] = {}
     for field in inspect.type_info(dto_cls).fields:  # type: ignore[attr-defined]
         value = data.get(field.name)
-        if field.required and (value is None):
+        if field.required and value is None:
             raise ValueError(f"Missing required by {dto_cls.__name__!r} config field: {field.name}")
         if value is None:
             continue
@@ -41,10 +40,6 @@ def _convert_value(value: str, msg_type: inspect.Type) -> Any:
         inspect.IntType: _convert_to_int,
         inspect.FloatType: _convert_to_float,
         inspect.BoolType: _convert_to_bool,
-        inspect.ListType: _convert_to_list,
-        inspect.DictType: _convert_to_dict,
-        inspect.EnumType: _convert_to_enum,
-        inspect.LiteralType: _convert_to_literal,
         inspect.UnionType: _convert_to_union,
     }
     if handler := _map.get(type(msg_type)):
@@ -78,21 +73,3 @@ def _convert_to_bool(value: Any, _: inspect.Type) -> bool:
     if value.lower() in ("false", "0"):
         return False
     raise ValueError(f"Invalid value for bool: {value!r}")
-
-
-def _convert_to_list(value: Any, _: inspect.Type) -> list[Any]:
-    return list(literal_eval(value))
-
-
-def _convert_to_dict(value: Any, _: inspect.Type) -> dict[Any, Any]:
-    return dict(literal_eval(value))
-
-
-def _convert_to_enum(value: Any, type: inspect.EnumType) -> Any:
-    return type.cls(value)
-
-
-def _convert_to_literal(value: Any, type: inspect.LiteralType) -> Any:
-    if value not in type.values:
-        raise ValueError(f"Invalid value for {type.values} by {type}")
-    return value

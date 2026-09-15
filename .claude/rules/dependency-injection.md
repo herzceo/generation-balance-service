@@ -21,7 +21,7 @@ def create_container(
     providers = [
         create_infra_provider(engine=engine, redis=redis, billing_config=billing_config,
                               store_config=store_config or RedisBalanceStoreConfig()),
-        create_billing_provider(),
+        create_billing_provider(with_generation=provider is not None),
     ]
     if provider is not None:
         providers.append(create_provider_provider(provider))
@@ -46,7 +46,10 @@ def create_database_provider() -> Provider:
 ## Scopes
 
 - **`Scope.APP`**: singletons -- configs, engine, session maker, Redis client, `BalanceStore`, `GenerationProvider`
-- **`Scope.REQUEST`**: per-operation -- `Database`, `BalanceLoader`, `GenerationService`, `BalanceService`, `BalanceFlusher`
+- **`Scope.REQUEST`**: per-operation -- `Database`, `BalanceLoader`, `ReservationRefunder`,
+  `ReservationReaper`, `BalanceService`, `BalanceFlusher`, and `GenerationService` when a
+  `GenerationProvider` was supplied. The graph is validated at build time: a REQUEST factory whose
+  dependency has no provider fails the whole container, not just that factory
 
 Callers open one REQUEST scope per operation:
 

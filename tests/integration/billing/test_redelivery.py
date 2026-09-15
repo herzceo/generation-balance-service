@@ -123,7 +123,6 @@ async def test_redelivery_waiter_times_out_when_holder_never_settles(
         await store.reserve(
             request=request,
             expected_version=snapshot.version,
-            new=snapshot.apply_plan(plan),
             plan=plan,
             authorized_cost_usd=Decimal("0.08"),
             started_at=time(),

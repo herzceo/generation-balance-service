@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from decimal import Decimal
 from typing import Any, cast, final
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from redis.asyncio import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -26,10 +26,12 @@ from backend.app.shared.ports.billing.balance_store import (
     SettleOutcome,
     Stale,
     TopUpOutcome,
+    micros_to_money,
+    money_to_micros,
     money_to_str,
     str_to_money,
 )
-from backend.domain.generation import DebitPlan, GenerationRequest
+from backend.domain.generation import BalanceTopUp, DebitPlan, GenerationRequest
 from backend.infra.database.redis import scripts
 from backend.internal import Option
 from backend.internal.dto import StructDTO
@@ -63,20 +65,33 @@ def top_up_key(operation_id: UUID) -> str:
     return f"topup:{operation_id}"
 
 
+def _micros(amount: Decimal) -> str:
+    return str(money_to_micros(amount))
+
+
 def _snapshot_args(snapshot: BalanceSnapshot) -> list[str]:
     return [
-        money_to_str(snapshot.free_usd),
-        money_to_str(snapshot.bonus_usd),
-        money_to_str(snapshot.paid_usd),
+        _micros(snapshot.free_usd),
+        _micros(snapshot.bonus_usd),
+        _micros(snapshot.paid_usd),
         str(snapshot.free_requests),
+    ]
+
+
+def _plan_args(plan: DebitPlan) -> list[str]:
+    return [
+        _micros(plan.free_usd),
+        _micros(plan.bonus_usd),
+        _micros(plan.paid_usd),
+        str(plan.free_requests),
     ]
 
 
 def _snapshot_from_conflict(reply: list[str]) -> BalanceSnapshot:
     return BalanceSnapshot(
-        free_usd=str_to_money(reply[1]),
-        bonus_usd=str_to_money(reply[2]),
-        paid_usd=str_to_money(reply[3]),
+        free_usd=micros_to_money(int(reply[1])),
+        bonus_usd=micros_to_money(int(reply[2])),
+        paid_usd=micros_to_money(int(reply[3])),
         free_requests=int(reply[4]),
         version=int(reply[5]),
     )
@@ -84,39 +99,40 @@ def _snapshot_from_conflict(reply: list[str]) -> BalanceSnapshot:
 
 def _snapshot_from_hash(fields: dict[str, str]) -> BalanceSnapshot:
     return BalanceSnapshot(
-        free_usd=str_to_money(fields["free_usd"]),
-        bonus_usd=str_to_money(fields["bonus_usd"]),
-        paid_usd=str_to_money(fields["paid_usd"]),
+        free_usd=micros_to_money(int(fields["free_usd"])),
+        bonus_usd=micros_to_money(int(fields["bonus_usd"])),
+        paid_usd=micros_to_money(int(fields["paid_usd"])),
         free_requests=int(fields["free_requests"]),
         version=int(fields["version"]),
     )
 
 
 def _record_from_fields(fields: dict[str, str]) -> GenerationRecord:
+    raw_bill = fields.get("provider_billed_cost_usd")
     return GenerationRecord(
         status=GenerationStatus(fields["status"]),
         user_id=UUID(fields["user_id"]),
         dialog_id=UUID(fields["dialog_id"]),
         model_name=fields["model_name"],
         plan=DebitPlan(
-            free_usd=str_to_money(fields["plan_free_usd"]),
-            bonus_usd=str_to_money(fields["plan_bonus_usd"]),
-            paid_usd=str_to_money(fields["plan_paid_usd"]),
+            free_usd=micros_to_money(int(fields["plan_free_usd"])),
+            bonus_usd=micros_to_money(int(fields["plan_bonus_usd"])),
+            paid_usd=micros_to_money(int(fields["plan_paid_usd"])),
             free_requests=int(fields["plan_free_requests"]),
         ),
-        authorized_cost_usd=str_to_money(fields["authorized_cost_usd"]),
+        authorized_cost_usd=micros_to_money(int(fields["authorized_cost_usd"])),
         started_at=float(fields["started_at"]),
         content=fields.get("content") or None,
-        billed_cost_usd=_optional_money(fields, "billed_cost_usd"),
-        provider_billed_cost_usd=_optional_money(fields, "provider_billed_cost_usd"),
-        refunded_surplus_usd=_optional_money(fields, "refunded_surplus_usd"),
+        billed_cost_usd=_optional_micros(fields, "billed_cost_usd"),
+        provider_billed_cost_usd=str_to_money(raw_bill) if raw_bill else None,
+        refunded_surplus_usd=_optional_micros(fields, "refunded_surplus_usd"),
         error=fields.get("error") or None,
     )
 
 
-def _optional_money(fields: dict[str, str], name: str) -> Decimal | None:
+def _optional_micros(fields: dict[str, str], name: str) -> Decimal | None:
     raw = fields.get(name)
-    return str_to_money(raw) if raw else None
+    return micros_to_money(int(raw)) if raw else None
 
 
 _DUP_FIELDS = (
@@ -135,16 +151,19 @@ _DUP_FIELDS = (
     "provider_billed_cost_usd",
     "refunded_surplus_usd",
     "error",
+    "reservation_token",
 )
 
 
 @final
 class ImplRedisBalanceStore(BalanceStore):
     __slots__ = (
+        "_advance_version",
         "_clear_dirty",
         "_config",
         "_redis",
         "_refund",
+        "_release_load_lock",
         "_reserve",
         "_seed",
         "_settle",
@@ -154,15 +173,17 @@ class ImplRedisBalanceStore(BalanceStore):
     def __init__(self, redis: Redis, config: RedisBalanceStoreConfig) -> None:
         self._redis = redis
         self._config = config
+        self._advance_version = redis.register_script(scripts.ADVANCE_VERSION)
         self._reserve = redis.register_script(scripts.RESERVE)
         self._settle = redis.register_script(scripts.SETTLE)
         self._refund = redis.register_script(scripts.REFUND)
         self._top_up = redis.register_script(scripts.TOP_UP)
         self._seed = redis.register_script(scripts.SEED_IF_ABSENT)
+        self._release_load_lock = redis.register_script(scripts.RELEASE_LOAD_LOCK)
         self._clear_dirty = redis.register_script(scripts.CLEAR_DIRTY)
 
     async def _retrying[T](self, call: Callable[[], Awaitable[T]]) -> T:
-        """Re-issue a money-path command on transient transport errors; scripts are idempotent."""
+        """Retry on transport errors; every wrapped script recognises its own landed call."""
         attempt = 1
         while True:
             try:
@@ -197,60 +218,70 @@ class ImplRedisBalanceStore(BalanceStore):
         )
         return bool(reply)
 
-    async def try_acquire_load_lock(self, user_id: UUID) -> bool:
+    async def try_acquire_load_lock(self, user_id: UUID) -> str | None:
+        token = uuid4().hex
         acquired = await self._redis.set(
-            load_lock_key(user_id), "1", nx=True, px=self._config.LOAD_LOCK_TTL_MS
+            load_lock_key(user_id), token, nx=True, px=self._config.LOAD_LOCK_TTL_MS
         )
-        return bool(acquired)
+        return token if acquired else None
 
-    async def release_load_lock(self, user_id: UUID) -> None:
-        await self._redis.delete(load_lock_key(user_id))
+    async def release_load_lock(self, user_id: UUID, token: str) -> None:
+        await self._release_load_lock(keys=[load_lock_key(user_id)], args=[token])
+
+    async def advance_version(self, user_id: UUID, *, expected: int, to: int) -> bool:
+        reply = await self._retrying(
+            lambda: self._advance_version(
+                keys=[balance_key(user_id), DIRTY_KEY], args=[str(expected), str(to), str(user_id)]
+            )
+        )
+        return bool(reply)
 
     async def reserve(
         self,
         *,
         request: GenerationRequest,
         expected_version: int,
-        new: BalanceSnapshot,
         plan: DebitPlan,
         authorized_cost_usd: Decimal,
         started_at: float,
     ) -> ReserveOutcome:
+        token = uuid4().hex
         reply = cast(
             "list[str]",
-            await self._reserve(
-                keys=[
-                    balance_key(request.user_id),
-                    generation_key(request.client_request_id),
-                    DIRTY_KEY,
-                    INFLIGHT_KEY,
-                ],
-                args=[
-                    str(expected_version),
-                    *_snapshot_args(new),
-                    str(request.user_id),
-                    str(request.dialog_id),
-                    request.model_name,
-                    money_to_str(plan.free_usd),
-                    money_to_str(plan.bonus_usd),
-                    money_to_str(plan.paid_usd),
-                    str(plan.free_requests),
-                    money_to_str(authorized_cost_usd),
-                    repr(started_at),
-                    str(self._config.GENERATION_RECORD_TTL_SECONDS),
-                    str(request.client_request_id),
-                ],
+            await self._retrying(
+                lambda: self._reserve(
+                    keys=[
+                        balance_key(request.user_id),
+                        generation_key(request.client_request_id),
+                        DIRTY_KEY,
+                        INFLIGHT_KEY,
+                    ],
+                    args=[
+                        str(expected_version),
+                        str(request.user_id),
+                        str(request.dialog_id),
+                        request.model_name,
+                        *_plan_args(plan),
+                        _micros(authorized_cost_usd),
+                        repr(started_at),
+                        str(self._config.GENERATION_RECORD_TTL_SECONDS),
+                        str(request.client_request_id),
+                        token,
+                    ],
+                )
             ),
         )
         match reply[0]:
             case "OK":
-                return Reserved(version=int(reply[1]))
+                return Reserved()
             case "CONFLICT":
                 return Conflict(current=_snapshot_from_conflict(reply))
             case "MISSING":
                 return Missing()
             case _:
                 fields = dict(zip(_DUP_FIELDS, reply[1:], strict=True))
+                if fields["reservation_token"] == token:
+                    return Reserved()
                 return Duplicate(record=_record_from_fields(fields))
 
     async def get_generation(self, client_request_id: UUID) -> Option[GenerationRecord]:
@@ -268,11 +299,8 @@ class ImplRedisBalanceStore(BalanceStore):
         content: str,
         billed_cost_usd: Decimal,
         provider_billed_cost_usd: Decimal,
-        refunded_surplus_usd: Decimal,
-        expected_version: int | None,
-        new: BalanceSnapshot | None,
+        refund: DebitPlan,
     ) -> SettleOutcome:
-        balance_args = _snapshot_args(new) if new is not None else ["", "", "", ""]
         reply = cast(
             "list[str]",
             await self._retrying(
@@ -285,14 +313,15 @@ class ImplRedisBalanceStore(BalanceStore):
                     ],
                     args=[
                         content,
-                        money_to_str(billed_cost_usd),
+                        _micros(billed_cost_usd),
                         money_to_str(provider_billed_cost_usd),
                         str(self._config.GENERATION_RECORD_TTL_SECONDS),
                         str(client_request_id),
                         str(user_id),
-                        "" if expected_version is None else str(expected_version),
-                        *balance_args,
-                        money_to_str(refunded_surplus_usd),
+                        _micros(refund.free_usd),
+                        _micros(refund.bonus_usd),
+                        _micros(refund.paid_usd),
+                        _micros(refund.total_usd),
                     ],
                 )
             ),
@@ -300,21 +329,15 @@ class ImplRedisBalanceStore(BalanceStore):
         match reply[0]:
             case "OK":
                 return Applied()
-            case "CONFLICT":
-                return Conflict(current=_snapshot_from_conflict(reply))
+            case "DONE":
+                return AlreadyApplied()
             case "MISSING":
                 return Missing()
             case _:
                 return Stale()
 
     async def refund(
-        self,
-        *,
-        user_id: UUID,
-        client_request_id: UUID,
-        expected_version: int,
-        new: BalanceSnapshot,
-        error: str,
+        self, *, user_id: UUID, client_request_id: UUID, plan: DebitPlan, error: str
     ) -> RefundOutcome:
         reply = cast(
             "list[str]",
@@ -327,12 +350,11 @@ class ImplRedisBalanceStore(BalanceStore):
                         INFLIGHT_KEY,
                     ],
                     args=[
-                        str(expected_version),
-                        *_snapshot_args(new),
                         str(user_id),
                         error,
                         str(self._config.GENERATION_RECORD_TTL_SECONDS),
                         str(client_request_id),
+                        *_plan_args(plan),
                     ],
                 )
             ),
@@ -340,38 +362,34 @@ class ImplRedisBalanceStore(BalanceStore):
         match reply[0]:
             case "OK":
                 return Applied()
-            case "CONFLICT":
-                return Conflict(current=_snapshot_from_conflict(reply))
             case "MISSING":
                 return Missing()
             case _:
                 return Stale()
 
-    async def top_up(
-        self,
-        *,
-        operation_id: UUID,
-        user_id: UUID,
-        expected_version: int,
-        new: BalanceSnapshot,
-    ) -> TopUpOutcome:
+    async def top_up(self, command: BalanceTopUp) -> TopUpOutcome:
         reply = cast(
             "list[str]",
-            await self._top_up(
-                keys=[balance_key(user_id), top_up_key(operation_id), DIRTY_KEY],
-                args=[
-                    str(expected_version),
-                    *_snapshot_args(new),
-                    str(user_id),
-                    str(self._config.TOP_UP_RECORD_TTL_SECONDS),
-                ],
+            await self._retrying(
+                lambda: self._top_up(
+                    keys=[
+                        balance_key(command.user_id),
+                        top_up_key(command.operation_id),
+                        DIRTY_KEY,
+                    ],
+                    args=[
+                        str(command.user_id),
+                        str(self._config.TOP_UP_RECORD_TTL_SECONDS),
+                        _micros(command.paid_usd),
+                        _micros(command.bonus_usd),
+                        str(command.free_requests),
+                    ],
+                )
             ),
         )
         match reply[0]:
             case "OK":
                 return Applied()
-            case "CONFLICT":
-                return Conflict(current=_snapshot_from_conflict(reply))
             case "MISSING":
                 return Missing()
             case _:

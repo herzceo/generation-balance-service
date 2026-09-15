@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from sqlalchemy import MetaData
 from sqlalchemy.ext.declarative import declared_attr
@@ -19,26 +19,14 @@ class Base(DeclarativeBase):
     __abstract__: bool = True
     metadata = MetaData(naming_convention=convention)
 
-    if TYPE_CHECKING:
-        id: Any
-
     @declared_attr.directive
     def __tablename__(self) -> str:
         return pascal_case_to_snake_case(self.__name__)
 
     def to_builtins(self) -> dict[str, Any]:
-        d = {}
-        for column in self.__table__.columns:
-            value = getattr(self, column.name)
-            if value is None:
-                if column.server_default is not None:
-                    continue
-                if column.autoincrement is True:
-                    continue
-                if column.default is not None:
-                    if column.default.is_callable:
-                        value = column.default.arg(None)
-                    else:
-                        value = column.default.arg
-            d[column.name] = value
-        return d
+        values = {column.name: getattr(self, column.name) for column in self.__table__.columns}
+        return {
+            name: value
+            for name, value in values.items()
+            if value is not None or self.__table__.columns[name].server_default is None
+        }

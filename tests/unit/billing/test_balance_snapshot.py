@@ -1,54 +1,15 @@
 from decimal import Decimal
-from uuid import uuid4
 
-from backend.app.shared.ports.billing import BalanceSnapshot, money_to_str, str_to_money
-from backend.domain.generation import BalanceTopUp, DebitPlan
+import pytest
 
-
-def _snapshot() -> BalanceSnapshot:
-    return BalanceSnapshot(
-        free_usd=Decimal("0.10"),
-        bonus_usd=Decimal("0.20"),
-        paid_usd=Decimal("1.00"),
-        free_requests=3,
-        version=7,
-    )
-
-
-def test_apply_plan_subtracts_every_bucket() -> None:
-    plan = DebitPlan(
-        free_usd=Decimal("0.05"),
-        bonus_usd=Decimal("0.20"),
-        paid_usd=Decimal("0.08"),
-        free_requests=1,
-    )
-    result = _snapshot().apply_plan(plan)
-    assert result.free_usd == Decimal("0.05")
-    assert result.bonus_usd == Decimal(0)
-    assert result.paid_usd == Decimal("0.92")
-    assert result.free_requests == 2
-    assert result.version == 7
-
-
-def test_refund_plan_restores_original() -> None:
-    plan = DebitPlan(free_usd=Decimal("0.10"), paid_usd=Decimal("0.03"), free_requests=1)
-    original = _snapshot()
-    assert original.apply_plan(plan).refund_plan(plan) == original
-
-
-def test_apply_top_up_leaves_free_usd_untouched() -> None:
-    top_up = BalanceTopUp(
-        operation_id=uuid4(),
-        user_id=uuid4(),
-        paid_usd=Decimal("2.50"),
-        bonus_usd=Decimal("0.05"),
-        free_requests=2,
-    )
-    result = _snapshot().apply_top_up(top_up)
-    assert result.free_usd == Decimal("0.10")
-    assert result.bonus_usd == Decimal("0.25")
-    assert result.paid_usd == Decimal("3.50")
-    assert result.free_requests == 5
+from backend.app.shared.ports.billing import (
+    BalanceSnapshot,
+    micros_to_money,
+    money_to_micros,
+    money_to_str,
+    quantize_money,
+    str_to_money,
+)
 
 
 def test_zero_snapshot() -> None:
@@ -68,3 +29,27 @@ def test_money_serialisation_round_trip() -> None:
     for raw in ("0.05", "0.000001", "123456789012.123456"):
         assert money_to_str(str_to_money(raw)) == raw
         assert str_to_money(money_to_str(Decimal(raw))) == Decimal(raw)
+
+
+def test_micros_round_trip() -> None:
+    assert money_to_micros(Decimal(0)) == 0
+    assert money_to_micros(Decimal("1E+2")) == 100_000_000
+    assert money_to_micros(Decimal("0.000001")) == 1
+    for raw in ("0", "0.05", "0.92", "123456789012.123456"):
+        assert micros_to_money(money_to_micros(Decimal(raw))) == Decimal(raw)
+
+
+def test_micros_rejects_amounts_finer_than_the_quantum() -> None:
+    with pytest.raises(ValueError, match="finer"):
+        money_to_micros(Decimal("0.0000001"))
+
+
+def test_quantize_money_keeps_six_decimals_unchanged() -> None:
+    for raw in ("0", "0.05", "0.000001", "123456789012.123456"):
+        assert quantize_money(Decimal(raw)) == Decimal(raw)
+
+
+def test_quantize_money_rounds_down_beyond_six_decimals() -> None:
+    assert quantize_money(Decimal("0.0266666666")) == Decimal("0.026666")
+    assert quantize_money(Decimal("0.0000009")) == Decimal(0)
+    assert quantize_money(Decimal(1) / Decimal(3)) == Decimal("0.333333")

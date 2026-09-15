@@ -56,7 +56,7 @@ or through the port's method arguments; do not import `app/billing/config.py` fr
 
 ```python
 # domain/ importing from app/ -- VIOLATION
-from backend.app.errors import NotFoundError  # wrong
+from backend.app.errors import InvalidInputError  # wrong
 
 # domain/ only imports from domain/ and internal/
 from backend.domain.entities.base import Base  # correct

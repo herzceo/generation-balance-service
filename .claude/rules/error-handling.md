@@ -11,7 +11,6 @@ paths:
 ```python
 ApplicationError                         # Base
   DetailedError(message, code, details)  # Structured
-    NotFoundError                        # not_found
     InvalidInputError                    # invalid_input (unknown model, bad top-up amount, payload drift)
     ConflictError                        # conflict
       BalanceContentionError             # balance_contention (CAS or cold-load retries exhausted)
@@ -28,7 +27,7 @@ wrapped; a redelivery recomputes them against the current balance.
 
 `DetailedError` is **not** a dataclass. It uses `_default_message` / `_default_code` as `ClassVar[str]` and a manual `__init__` that falls back to those class-level defaults when the caller does not pass `message=` / `code=`.
 
-Do not "simplify" this back to `@dataclass(eq=False)` with `code: str = ""` as a field. If you do, every subclass override (`code = "not_found"`) is silently shadowed by the dataclass-generated `__init__`, which writes the empty default to every instance. The exception will look correct at the class level (`NotFoundError.code == "not_found"`) but `instance.code` will be `""`.
+Do not "simplify" this back to `@dataclass(eq=False)` with `code: str = ""` as a field. If you do, every subclass override (`code = "not_found"`) is silently shadowed by the dataclass-generated `__init__`, which writes the empty default to every instance. The exception will look correct at the class level (`InvalidInputError.code == "invalid_input"`) but `instance.code` will be `""`.
 
 When adding a new error type, override the `ClassVar`s only:
 
@@ -58,20 +57,22 @@ if row is None:
 # wrong -- manual None check where absence is an error
 record = await self.store.get_generation(client_request_id)
 if record.value is None:
-    raise NotFoundError()
+    raise InvalidInputError(message="unknown generation")
 ```
 
-Other Option methods:
-- `.none(exc)` -- raise if value IS present (for uniqueness checks)
-- `.some_or(default)` -- return value or default without raising
+`some(exc)` is the only unwrapping helper. Add another one when a second call site needs it, not
+before -- an `Option` method with no production caller is dead code with a unit test attached.
 
 ## Money paths
 
 - Wrap provider exceptions into `GenerationFailedError` **after** the refund has been applied;
   refund on `BaseException` so cancellation also refunds, then re-raise the original.
 - `refund` outcome `Stale` means the record is no longer `running`: return, never retry the balance
-  change. `settle` outcome `Stale` means the reaper already refunded the reservation: discard the
-  result and raise `GenerationFailedError`, never return a refunded generation.
+  change. `settle` distinguishes the two ways a record can already be out of `running`:
+  `AlreadyApplied` (the record is `done`, so this settle -- or its lost-reply twin -- already
+  landed) returns the charge, while `Stale` (the reaper refunded the reservation) discards the
+  result and raises `GenerationFailedError`. Collapsing them turns a successful settle into a
+  bogus failure after a transport retry.
 - Retry exhaustion raises `BalanceContentionError`; never silently drop an operation.
 
 ## Key Rules

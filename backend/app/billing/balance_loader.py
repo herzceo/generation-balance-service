@@ -26,14 +26,15 @@ class BalanceLoader:
             snapshot = (await self.store.load(user_id)).value
             if snapshot is not None:
                 return snapshot
-            if await self.store.try_acquire_load_lock(user_id):
+            token = await self.store.try_acquire_load_lock(user_id)
+            if token is not None:
                 try:
                     snapshot = (await self.store.load(user_id)).value
                     if snapshot is not None:
                         return snapshot
                     await self.store.seed_if_absent(user_id, await self._load_from_db(user_id))
                 finally:
-                    await self.store.release_load_lock(user_id)
+                    await self.store.release_load_lock(user_id, token)
                 continue
             if monotonic() > deadline:
                 raise BalanceContentionError(message="balance load timed out")
