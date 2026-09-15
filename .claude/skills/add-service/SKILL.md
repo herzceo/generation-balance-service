@@ -76,4 +76,4 @@ Run `just check`, then add the integration test (`/add-test billing <scenario>`)
 - All money arithmetic happens here or on `BalanceSnapshot`, in `Decimal`
 - Balance mutations go through the store's CAS methods in a bounded retry loop; exhaustion raises
   `BalanceContentionError`
-- Read `docs/PLAN.md` §4.10 for the reference algorithms before adding a new mutation path
+- Read `README.md` (`execute_generation`, `apply_top_up`) for the reference algorithms before adding a new mutation path

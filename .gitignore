@@ -871,3 +871,6 @@ test.py
 .caveman-active
 .caveman-history.jsonl
 .caveman-statusline-suffix
+
+# assignment text, kept local only
+TASK.md

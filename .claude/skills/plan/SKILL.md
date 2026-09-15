@@ -49,7 +49,7 @@ What Lua scripts exist?
 ```
 !`grep -n "^[A-Z_]* = " backend/infra/database/redis/scripts.py 2>/dev/null`
 
-Read the relevant existing files and `docs/DECISIONS.md` to understand current patterns and what can be reused.
+Read the relevant existing files and `README.md` to understand current patterns and what can be reused.
 
 ## Step 3: Produce the plan
 

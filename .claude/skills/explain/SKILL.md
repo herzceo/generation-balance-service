@@ -45,7 +45,7 @@ Check the question for keywords and select the 1–3 most relevant rule files to
 | port, adapter, protocol, abstraction, dependency inversion, Redis, Lua, CAS, version, key layout | `ports-adapters.md` |
 | DI, dependency injection, provider, Dishka, scope, wire, container | `dependency-injection.md` |
 | error, exception, Option, DetailedError, some, access error, refund | `error-handling.md` |
-| service, loader, flusher, reservation, top-up, write-behind, cold load | `CLAUDE.md` Key Patterns + `docs/DECISIONS.md` |
+| service, loader, flusher, reservation, top-up, write-behind, cold load | `CLAUDE.md` Key Patterns + `README.md` |
 | test, integration test, unit test, fixture, multiprocess, statement count | `testing.md` |
 | type, mypy, generic, typing, annotation, given module | `typing.md` |
 | migration, Alembic, schema, database, transaction, session | `database.md` |

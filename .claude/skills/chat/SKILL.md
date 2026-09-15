@@ -18,7 +18,7 @@ Before researching anything, ask:
 
 1. **Priority axis**: speed to ship vs. long-term maintainability — where does this sit?
 2. **Scale and lifespan**: expected load (generations per second, users), how long this code will be owned and evolved?
-3. **Integration constraints**: what must not break? The given module is fixed; the PostgreSQL budget (accesses ≪ generations) is fixed; which other decisions in `docs/DECISIONS.md` are fixed?
+3. **Integration constraints**: what must not break? The given module is fixed; the PostgreSQL budget (accesses ≪ generations) is fixed; which other decisions in `README.md` are fixed?
 
 Wait for answers. Do not proceed to Step 2 on assumption.
 
@@ -29,7 +29,7 @@ Run `/research <topic>` to establish:
 - What the layer boundaries and DI approach imply about the decision
 - What downstream code would be affected by each option
 
-Read `docs/DECISIONS.md`: many alternatives were already weighed there, with reasons.
+Read `README.md`: many alternatives were already weighed there, with reasons.
 
 ## Step 3: Survey established approaches
 

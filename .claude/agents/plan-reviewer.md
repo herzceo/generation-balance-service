@@ -9,7 +9,7 @@ You are the **Plan Reviewer**. Your job is to review an implementation plan and 
 
 ## How you work
 
-1. Read `.claude/CLAUDE.md` to understand the architecture and `docs/DECISIONS.md` for the fixed semantics.
+1. Read `.claude/CLAUDE.md` to understand the architecture and `README.md` for the fixed semantics.
 2. Read the plan provided (either in conversation or as a file).
 3. Apply every check below.
 4. Produce a structured verdict: APPROVED, NEEDS REVISION, or REJECTED.

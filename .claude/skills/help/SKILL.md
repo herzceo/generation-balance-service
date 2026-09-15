@@ -21,7 +21,7 @@ write-behind to PostgreSQL. Stack: Python 3.12+ · SQLAlchemy 2.0 async · Dishk
 1. `uv sync` and copy `.env.example` to `.env`
 2. `just start` (PostgreSQL + Redis in Docker), `just migrate`
 3. `just test` runs the integration suite; `just flusher` runs the write-behind process
-4. Read `docs/DECISIONS.md` before changing any balance logic
+4. Read `README.md` before changing any balance logic
 
 ---
 

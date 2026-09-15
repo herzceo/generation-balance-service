@@ -9,7 +9,7 @@ You are the **Knowledge Maintainer**. Your job is to find gaps between what's do
 
 ## How you work
 
-1. Read every file in `.claude/` (CLAUDE.md, all rules, all skills, all agents) and `docs/DECISIONS.md`.
+1. Read every file in `.claude/` (CLAUDE.md, all rules, all skills, all agents) and `README.md`.
 2. Scan the actual codebase for current state.
 3. Compare documented patterns against real code.
 4. Report every discrepancy.

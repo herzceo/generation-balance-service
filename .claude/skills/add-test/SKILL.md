@@ -36,7 +36,7 @@ behaviour. Real PostgreSQL + Redis via testcontainers, the real `FakeGenerationP
 1. `tests/integration/billing/conftest.py` and `helpers.py` -- fixtures and helpers
 2. The service under test in `backend/app/billing/`
 3. A neighbouring test in the same file for the pattern in use
-4. `docs/DECISIONS.md` for the semantic being tested (redelivery, cached failure, cold load)
+4. `README.md` for the semantic being tested (redelivery, cached failure, cold load)
 
 ## Standard fixtures and helpers
 

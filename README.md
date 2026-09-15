@@ -1,16 +1,5 @@
 # Генерации и баланс пользователей
 
-Решение тестового задания из `TASK.md`. Сервис принимает генерации и пополнения баланса,
-держит балансы в Redis и периодически сбрасывает их в PostgreSQL. HTTP API нет, сервисы
-вызываются из тестов и из фонового процесса `backend flusher`.
-
-Стек: Python 3.12, asyncio, SQLAlchemy 2.0 (psycopg), Alembic, redis-py (Lua-скрипты),
-Dishka, msgspec, pytest + testcontainers.
-
-Модуль из условия задания лежит в `backend/domain/generation.py` и совпадает с текстом задания
-байт в байт (строки 16–329 файла `TASK.md`). Он исключён из `ruff` и из строгой проверки `mypy`,
-потому что в исходном виде не проходит ни то, ни другое, а менять его нельзя.
-
 ## Запуск
 
 Нужны `uv`, `just`, Docker. Python 3.12 ставится `uv` автоматически.
@@ -35,6 +24,19 @@ just test           # 56 интеграционных тестов, testcontaine
 Если testcontainers падает на Ryuk (`Port mapping ... 8080 is not available`), задайте
 `TESTCONTAINERS_RYUK_DISABLED=true`.
 
+## Обзор
+
+Сервис принимает генерации и пополнения баланса, держит балансы в Redis и периодически
+сбрасывает их в PostgreSQL. HTTP API нет, сервисы вызываются из тестов и из фонового процесса
+`backend flusher`.
+
+Стек: Python 3.12, asyncio, SQLAlchemy 2.0 (psycopg), Alembic, redis-py (Lua-скрипты),
+Dishka, msgspec, pytest + testcontainers.
+
+Модуль `backend/domain/generation.py` (политика списания, контракты и `FakeGenerationProvider`)
+взят как есть и не редактируется. Он исключён из `ruff` и из строгой проверки `mypy`, потому что
+в исходном виде не проходит ни то, ни другое.
+
 ## Схема PostgreSQL
 
 Одна таблица `balance`, одна миграция `backend/infra/database/psql/alembic/migrations/versions/`.
@@ -53,7 +55,7 @@ excluded.version > balance.version`. Тест `tests/integration/test_migrations
 
 ## Архитектура
 
-Слои шаблона сохранены: `domain` (модуль задания, сущность `Balance`, протокол репозитория),
+Четыре слоя: `domain` (`generation.py`, сущность `Balance`, протокол репозитория),
 `app` (сервисы и порты), `infra` (PostgreSQL и Redis), `entry` (DI-контейнер и запуск flusher).
 `app` не импортирует `infra`, это проверяет `just check`.
 
@@ -149,15 +151,12 @@ Redis является источником истины во время раб�
   отменена. Порог настраивается.
 - Повторы при обрыве Redis ограничены 3 попытками. Если Redis недоступен дольше, резерв
   останется `running` до reaper'а.
-- Распределённый запуск на нескольких машинах не рассматривался, как и сказано в задании.
-
-Подробный разбор вариантов и крайних случаев: `docs/DECISIONS.md`, план реализации:
-`docs/PLAN.md`.
+- Распределённый запуск на нескольких машинах не рассматривался.
 
 ## Как проверялась корректность
 
 Все интеграционные тесты идут против настоящих PostgreSQL и Redis в testcontainers и
-настоящего `FakeGenerationProvider` из модуля задания. Моков нет. Каждый тест берёт нового
+настоящего `FakeGenerationProvider` из `backend/domain/generation.py`. Моков нет. Каждый тест берёт нового
 пользователя и чистит Redis.
 
 | Файл | Что проверяется |

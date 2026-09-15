@@ -43,7 +43,7 @@ Read each of these and check if they're still accurate:
 2. `.claude/rules/*.md` — do code examples still match current code? Any new conventions?
 3. `.claude/skills/*/SKILL.md` — do the `!find` commands reflect current structure? Any new skill needed?
 4. `.claude/agents/*.md` — do review checklists cover all current patterns?
-5. `docs/DECISIONS.md` — are new decisions or deviations recorded?
+5. `README.md` — are new decisions or deviations recorded?
 
 ## Step 3: Identify gaps
 
@@ -80,6 +80,6 @@ After the user approves, update the files. For each change:
 
 - After adding a new service, port, adapter or Lua script
 - After the user corrects your approach on something non-obvious
-- After changing a concurrency or storage pattern (record in `docs/DECISIONS.md` too)
+- After changing a concurrency or storage pattern (record in `README.md` too)
 - After changing an established pattern
 - Periodically (every few sessions) as a hygiene check

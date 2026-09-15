@@ -25,7 +25,7 @@ Find all files related to the topic:
 - Services: `find backend/app/billing -name "*.py"` — read use cases
 - Redis adapter + Lua: `backend/infra/database/redis/adapters/balance_store.py`, `backend/infra/database/redis/scripts.py`
 - Composition root: `backend/entry/ioc.py`, `backend/entry/flusher.py`, `backend/main/cli.py`
-- Decisions: `docs/DECISIONS.md`, plan: `docs/PLAN.md`
+- Decisions and flow semantics: `README.md`
 
 ### 2. Trace a full operation flow
 

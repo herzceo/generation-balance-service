@@ -104,7 +104,6 @@ tests/
                  billing/{conftest.py, ioc.py, helpers.py, test_single.py, test_parallel.py, test_redelivery.py,
                           test_provider_errors.py, test_top_up.py, test_cold_cache.py, test_pg_budget.py,
                           test_convergence.py, test_multiprocess.py, test_settle_reconciliation.py, test_reaper.py}}
-docs/{PLAN.md, DECISIONS.md}
 ```
 
 ## Import Direction (strictly enforced by hooks)
